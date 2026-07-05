@@ -1,17 +1,18 @@
 """
 Batched DB writer.
 
-Receives completed candles and DQ events from the market_db_writer loop.
-Writes them in bulk using a single session per batch — minimises
+Receives completed candles, DQ events, and raw ticks from the market_db_writer
+loop. Writes them in bulk using a single session per batch — minimises
 connection-pool pressure on small EC2.
 
 What gets written:
   Candle1m   — one row per completed 1-min bucket per symbol
   DQEvent    — one row per FLAG or REJECT tick (sparse)
-  MarketTick — NOT written here; handled by regime_scan_task (hourly)
-
-What does NOT get written:
-  Raw ticks  — they stay in Redis streams only
+  MarketTick — one row per tick that wasn't REJECTed by the DQ pipeline
+               (PASS + FLAG, matching the candle aggregator's own gate).
+               Retention is short (RETAIN_MARKET_TICKS_HOURS) -- see
+               retension_task.py -- this is a rolling window for tick-level
+               analytics (OFI, LOF, regime), not a permanent tick archive.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session_factory
-from app.models.all_models import Candle1m, DQEvent
+from app.models.all_models import Candle1m, DQEvent, MarketTick
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,35 @@ async def flush_dq_events(events: list[dict]) -> None:
             log.debug(f"Flushed {len(events)} DQ events to DB")
     except Exception as e:
         log.error(f"flush_dq_events error: {e}", exc_info=True)
+
+
+async def flush_ticks(ticks: list[dict]) -> None:
+    """
+    Bulk-insert raw ticks that the DQ pipeline didn't REJECT (PASS + FLAG --
+    same gate the candle aggregator uses). No unique constraint on
+    market_ticks, so this is a plain insert, not an upsert.
+    """
+    if not ticks:
+        return
+    try:
+        async with get_session_factory()() as session:
+            session.add_all([
+                MarketTick(
+                    time       = _parse_time(t.get("time")),
+                    symbol_id  = t["symbol_id"],
+                    price      = t["price"],
+                    volume     = t.get("volume", 0),
+                    side       = t.get("side"),
+                    exchange   = t.get("source", "unknown"),
+                    dq_result  = t.get("dq_result", "PASS"),
+                    flags      = t.get("flags") or None,
+                )
+                for t in ticks
+            ])
+            await session.commit()
+            log.debug(f"Flushed {len(ticks)} ticks to DB")
+    except Exception as e:
+        log.error(f"flush_ticks error: {e}", exc_info=True)
 
 
 def _parse_time(ts) -> datetime:

@@ -34,6 +34,7 @@ from app.services.quant_engine import (
     detect_signal_conflicts,
     estimate_volatility_garch,
 )
+from app.services.intelligence.behavior_service import compute_behavior_session
 from app.helpers.helpers import (
     get_symbol_by_name,
     latest_regime,
@@ -204,6 +205,16 @@ async def compute_decision_current(
 
         _MULT = {"BULL": 1.0, "BEAR": 0.6, "RANGE": 0.8, "CRISIS": 0.3, "RECOVERY": 0.7}
 
+        # Real behavior score (override rate, frequency vs baseline, deviation
+        # from AI) instead of a fixed constant -- see behavior_service.py.
+        # None (rather than a fake number) if it can't be computed.
+        behavior_score = None
+        try:
+            behavior = await compute_behavior_session(current_user, db)
+            behavior_score = behavior["score"]
+        except Exception:  # noqa: BLE001
+            pass
+
         return {
             "symbol":          sym.symbol,
             "asset_class":     sym.asset_class,
@@ -281,7 +292,7 @@ async def compute_decision_current(
                 "open_positions": len(positions),
             },
             "gates":           gates,
-            "behavior_score":  85,
+            "behavior_score":  behavior_score,
             "data_latency_ms": round(_safe_float(safe_ms(ticks[-1].time)), 1) if ticks else 9999,
             "evaluated_at":    _now_iso(),
         }
@@ -497,21 +508,37 @@ async def compute_decision_traces(
         for o in orders:
             sym_str = sym_map.get(o.symbol_id, "UNKNOWN")
 
+            # Real per-order data: risk_check's recorded pass/fail checks (from
+            # order_service._risk_check()) and the transition trail
+            # Order.transition() records in state_history -- both persisted per
+            # order, unlike the fixed D3.x logic strings / confidence constants
+            # this replaces (there is no per-order record of the 8-gate quant
+            # core pipeline -- it's computed live/on-demand, not persisted at
+            # order submission time -- so this is the closest real substitute).
+            risk_check   = o.risk_check or {}
+            checks       = risk_check.get("checks", [])
+            passed_count = sum(1 for c in checks if c.get("passed"))
+            total_checks = len(checks) or 1
+
+            if o.state_history:
+                logic = " → ".join(f"{h.get('from') or 'NEW'}→{h['to']}" for h in o.state_history)
+            else:
+                logic = f"NEW→{o.status}"
+
             if o.status in ("FILLED", "PARTIAL"):
                 decision   = "ALLOW"
-                confidence = 85.0
-                logic      = "D3.1-PASS → D3.3-BULL → D3.4-ALLOW → D3.8-ALLOW"
+                confidence = round(70 + 30 * (passed_count / total_checks), 1)
                 mitigation = "Sniper limit order with 0.5σ buffer"
             elif o.status == "REJECTED":
                 decision   = "BLOCK"
-                confidence = 42.0
                 reason     = o.reject_reason or "Risk limit"
-                logic      = f"D3.1-PASS → D3.8-BLOCK: {reason}"
+                failed_n   = total_checks - passed_count
+                confidence = round(max(10.0, 70 - 30 * (failed_n / total_checks)), 1)
+                logic      = f"{logic} :: {reason}"
                 mitigation = "Order rejected — no position taken"
             else:
                 decision   = "REDUCE"
-                confidence = 61.0
-                logic      = "D3.3-BEAR → D3.7-REDUCE → D3.8-REDUCE"
+                confidence = round(50 + 20 * (passed_count / total_checks), 1)
                 mitigation = "Position size reduced 40% for regime"
 
             traces.append({

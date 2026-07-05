@@ -2,7 +2,6 @@ import asyncio
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from gunicorn.config import User
 import numpy as np
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +9,7 @@ from app.helpers.helpers import latest_regime, open_positions, primary_symbol, r
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.all_models import PnLSnapshot, Strategy
+from app.services.intelligence.behavior_service import compute_behavior_session
 from app.services.market_data_service import get_live_ticker, get_orderbook, get_recent_trades
 from app.services.quant_engine import build_quant_core_gates, estimate_volatility_garch, compute_technical_indicators, detect_signal_conflicts
 
@@ -168,7 +168,17 @@ async def compute_command_center_current(current_user, db) -> dict:
             ).scalar_one_or_none()
         except Exception:  # noqa: BLE001
             pass
- 
+
+        # Real behavior score (override rate, frequency vs baseline, deviation
+        # from AI) instead of a fixed constant -- see behavior_service.py.
+        # None (rather than a fake number) if it can't be computed.
+        behavior_score = None
+        try:
+            behavior = await compute_behavior_session(current_user, db)
+            behavior_score = behavior["score"]
+        except Exception:  # noqa: BLE001
+            pass
+
         # Live trade-flow analysis
         trade_flow: dict = {}
         if live_trades:
@@ -280,7 +290,7 @@ async def compute_command_center_current(current_user, db) -> dict:
                 "open_positions": len(positions),
             },
             "gates":           gates,
-            "behavior_score":  85,
+            "behavior_score":  behavior_score,
             "data_latency_ms": round(safe_float(safe_ms(ticks[-1].time)), 1) if ticks else 9999,
             "evaluated_at":    now_iso(),
         }

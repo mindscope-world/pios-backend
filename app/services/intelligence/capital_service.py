@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.all_models import Position, PnLSnapshot, Symbol, User, MarketTick, KillSwitchEvent
+from app.services.intelligence.cross_market_service import compute_gmig_snapshot
 from app.services.quant_engine import compute_hrp_allocation
 
 
@@ -92,22 +93,34 @@ async def compute_capital_allocation(
         hrp_weights = {k: 1.0/n for k in asset_exposure}
         total_deployed_pct = deployed_pct
 
+    # Real cross-market modifier per asset (compute_gmig_snapshot only covers
+    # forex pairs, so most crypto/equity assets fall back to 1.0 = neutral,
+    # i.e. no signal available -- rather than always being 1.0 regardless of
+    # whether any computation ever ran).
+    gmig_lookup: dict[str, float] = {}
+    try:
+        gmig = await compute_gmig_snapshot(current_user, db)
+        for m in gmig.get("modifiers", []):
+            base = m["symbol"].split("/")[0].upper()
+            gmig_lookup[base] = m["modifier"]
+    except Exception:  # noqa: BLE001
+        pass
+
     slices = []
     for asset, exposure in sorted(asset_exposure.items(), key=lambda x: -x[1]):
         current_pct = round((exposure / total_equity) * 100, 2) if total_equity else 0.0
         # HRP target weight × deployed pct
         raw_w = hrp_weights.get(asset, 1.0 / max(len(asset_exposure), 1))
         target_pct = round(raw_w * total_deployed_pct, 2)
-        gmig_modifier = 1.0
         slices.append({
             "asset": asset,
             "target_pct": target_pct,
             "current_pct": current_pct,
             "value_usd": round(exposure, 2),
-            "gmig_modifier": gmig_modifier,
+            "gmig_modifier": gmig_lookup.get(asset, 1.0),
         })
 
-    # Cash slice
+    # Cash slice — no cross-market modifier applies to cash.
     slices.append({
         "asset": "USDT",
         "target_pct": round(cash_pct, 2),
@@ -146,9 +159,10 @@ async def compute_rebalance(
     db: AsyncSession,
 ):
     """
-    Enqueue a capital rebalance job.
-    In production this would dispatch a Celery task.
-    We create a synthetic BacktestJob as a rebalance job record.
+    Enqueue a capital rebalance job: creates a BacktestJob record (the only
+    job-tracking table available) and dispatches rebalance_portfolio_task,
+    which recomputes real HRP target weights and writes them onto the job's
+    full_report -- matching run_backtest_task's dispatch pattern.
     """
     from app.models.all_models import BacktestJob, Strategy
     from app.services.audit_service import write_audit
@@ -162,7 +176,9 @@ async def compute_rebalance(
     strategy = strat_result.scalar_one_or_none()
 
     if not strategy:
-        # Create a synthetic job_id without persisting
+        # BacktestJob.strategy_id is NOT NULL -- with no strategy to attach to
+        # there's nowhere to persist a job row, so this returns an unpersisted
+        # id rather than dispatching work with nothing to track it against.
         job_id = str(uuid.uuid4())
         return {"job_id": job_id}
 
@@ -178,6 +194,17 @@ async def compute_rebalance(
         config={"type": "REBALANCE"},
     )
     db.add(job)
+    await db.flush()
+    job_id = str(job.id)
+
+    try:
+        from app.workers.backtest_worker import rebalance_portfolio_task
+        task = rebalance_portfolio_task.delay(job_id)
+        job.celery_task_id = task.id
+    except Exception:
+        # If Celery isn't running, mark for manual run (matches strategies.py's
+        # backtest-dispatch fallback).
+        job.celery_task_id = "no-celery"
 
     await write_audit(db, "REBALANCE_TRIGGERED", "capital", str(admin.id),
                       actor_id=admin.id, actor_email=admin.email)

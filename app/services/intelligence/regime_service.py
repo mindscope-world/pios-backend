@@ -1,12 +1,14 @@
 from datetime import datetime, timedelta, timezone
 
+import structlog
 from fastapi import HTTPException, Query
-from gunicorn.config import User
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.helpers.helpers import latest_regime, primary_symbol, recent_ticks, get_symbol_by_name, now_iso
 from app.models.all_models import RegimeState
 from app.services.market_data_service import compute_technical_indicators, get_live_ticker
+
+logger = structlog.get_logger()
 
 
 async def compute_regime_current(
@@ -85,9 +87,15 @@ async def compute_regime_current(
         if len(ticks_all) >= 14:
             prices_all  = [float(t.price)  for t in ticks_all]
             volumes_all = [float(t.volume) for t in ticks_all]
-            tech = await compute_technical_indicators(prices_all, volumes_all)
+            # compute_technical_indicators is synchronous -- awaiting it raised
+            # TypeError on every call, silently swallowed below, so "technicals"
+            # was always empty. See market_data_service.py:627.
+            tech = compute_technical_indicators(prices_all, volumes_all)
     except Exception:
-        pass
+        logger.warning(
+            "regime_current_live_enrichment_failed",
+            symbol=sym.symbol, exc_info=True,
+        )
 
     # Regime-based trading advisory
     advisories = {

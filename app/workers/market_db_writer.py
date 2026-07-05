@@ -31,7 +31,7 @@ from redis.exceptions import ConnectionError, TimeoutError, ResponseError
 from app.core.config import settings
 from app.workers.candle_aggregator import aggregator
 from app.workers.dq_pipeline import dq
-from app.workers.db_writer import flush_candles, flush_dq_events
+from app.workers.db_writer import flush_candles, flush_dq_events, flush_ticks
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ async def market_db_writer(redis) -> None:
 
     completed_candles: list[dict] = []
     dq_events:         list[dict] = []
+    raw_ticks:         list[dict] = []
     tick_count = 0
 
     while True:
@@ -57,9 +58,10 @@ async def market_db_writer(redis) -> None:
 
             if not item:
                 # Normal BLPOP timeout — queue was empty; flush stale candles
-                await _flush(completed_candles, dq_events)
+                await _flush(completed_candles, dq_events, raw_ticks)
                 completed_candles.clear()
                 dq_events.clear()
+                raw_ticks.clear()
                 tick_count = 0
                 continue
 
@@ -79,23 +81,29 @@ async def market_db_writer(redis) -> None:
             if dq_result in ("FLAG", "REJECT"):
                 dq_events.append(tick)
 
-            # ── Feed valid ticks into candle aggregator ────────
+            # ── Feed valid ticks into candle aggregator + tick store ──
             if dq_result != "REJECT":
                 done = aggregator.ingest(tick)
                 completed_candles.extend(done)
+                raw_ticks.append(tick)
 
             # ── Batch flush ────────────────────────────────────
             tick_count += 1
             if tick_count >= settings.DQ_BATCH_SIZE:
-                await _flush(completed_candles, dq_events)
+                await _flush(completed_candles, dq_events, raw_ticks)
                 completed_candles.clear()
                 dq_events.clear()
+                raw_ticks.clear()
                 tick_count = 0
 
         except asyncio.CancelledError:
             log.info("market_db_writer shutting down — flushing open candles")
             final = aggregator.flush_all()
-            await flush_candles(final)
+            await asyncio.gather(
+                flush_candles(final),
+                flush_ticks(raw_ticks),
+                return_exceptions=True,
+            )
             raise
 
         # ── Redis connection/timeout errors ───────────────────
@@ -119,11 +127,12 @@ async def market_db_writer(redis) -> None:
             await asyncio.sleep(1)
 
 
-async def _flush(candles: list[dict], dq_events: list[dict]) -> None:
-    """Run candle and DQ event flushes concurrently."""
+async def _flush(candles: list[dict], dq_events: list[dict], ticks: list[dict]) -> None:
+    """Run candle, DQ event, and raw tick flushes concurrently."""
     await asyncio.gather(
         flush_candles(candles),
         flush_dq_events(dq_events),
+        flush_ticks(ticks),
         return_exceptions=True,
     )
 
@@ -152,6 +161,7 @@ async def _kafka_consumer() -> None:
 
     completed_candles: list[dict] = []
     dq_events:         list[dict] = []
+    raw_ticks:         list[dict] = []
     tick_count = 0
 
     try:
@@ -169,12 +179,14 @@ async def _kafka_consumer() -> None:
 
             if dq_result != "REJECT":
                 completed_candles.extend(aggregator.ingest(tick))
+                raw_ticks.append(tick)
 
             tick_count += 1
             if tick_count >= settings.DQ_BATCH_SIZE:
-                await _flush(completed_candles, dq_events)
+                await _flush(completed_candles, dq_events, raw_ticks)
                 completed_candles.clear()
                 dq_events.clear()
+                raw_ticks.clear()
                 tick_count = 0
 
     except asyncio.CancelledError:

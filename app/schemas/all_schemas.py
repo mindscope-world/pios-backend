@@ -231,8 +231,8 @@ class PortfolioMetricsOut(BaseModel):
     active_strategies: int
     max_drawdown: float
     drawdown_limit: float
-    sharpe: float
-    win_rate: float
+    sharpe: float | None = None      # None = insufficient equity history to compute
+    win_rate: float | None = None    # None = no closed positions yet
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

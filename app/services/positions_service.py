@@ -4,10 +4,12 @@ from fastapi import Query
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.all_models import Position, PnLSnapshot, User
+from app.helpers.helpers import sharpe as compute_sharpe
+from app.models.all_models import Position, PnLSnapshot, RiskLimit, User
 from app.schemas.all_schemas import (
     PositionOut, EquityPoint, PortfolioMetricsOut,
 )
+from app.core.config import settings
 
 async def compute_positions(
     current_user: User,
@@ -93,6 +95,39 @@ async def compute_portfolio_metrics(
     )
     active_strategies = len(strat_result.scalars().all())
 
+    # Rolling Sharpe from the 90-day equity curve already fetched above.
+    sharpe_value = None
+    if len(snaps_90) >= 10:
+        equities = [float(s.total_equity) for s in snaps_90]
+        returns = [
+            (equities[i] - equities[i - 1]) / equities[i - 1]
+            for i in range(1, len(equities))
+            if equities[i - 1]
+        ]
+        if len(returns) >= 2:
+            sharpe_value = compute_sharpe(returns)
+
+    # Win rate from closed positions' realized PnL -- real per-position outcomes,
+    # not a fabricated constant.
+    closed_result = await db.execute(
+        select(Position).where(Position.user_id == current_user.id, Position.is_open == False)  # noqa: E712
+    )
+    closed_positions = closed_result.scalars().all()
+    win_rate_value = None
+    if closed_positions:
+        wins = sum(1 for p in closed_positions if float(p.realized_pnl) > 0)
+        win_rate_value = round(wins / len(closed_positions) * 100, 2)
+
+    # Drawdown limit from the active RiskLimit row, matching risk_service.py's pattern.
+    limit_result = await db.execute(
+        select(RiskLimit).where(
+            RiskLimit.limit_type == "max_drawdown_pct",
+            RiskLimit.is_active == True,  # noqa: E712
+        )
+    )
+    limit = limit_result.scalar_one_or_none()
+    drawdown_limit_value = float(limit.limit_value) if limit else settings.DEFAULT_MAX_DRAWDOWN_PCT
+
     return PortfolioMetricsOut(
         total_equity=round(total_equity, 2),
         equity_change=round(equity_change, 2),
@@ -102,9 +137,9 @@ async def compute_portfolio_metrics(
         unrealized_pnl=round(unrealized_pnl, 2),
         active_strategies=active_strategies,
         max_drawdown=round(max_dd, 4),
-        drawdown_limit=15.0,
-        sharpe=1.84,       # computed by Darwin engine in production
-        win_rate=58.3,
+        drawdown_limit=drawdown_limit_value,
+        sharpe=sharpe_value,
+        win_rate=win_rate_value,
     )
 
 

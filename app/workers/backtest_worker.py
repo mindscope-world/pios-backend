@@ -386,6 +386,87 @@ def alpha_factory_search(strategy_id: str | None = None):
             log.info(f"Alpha factory: {sym.symbol} — {len(features)} features extracted")
 
 
+@celery_app.task(bind=True, name="rebalance_portfolio", queue="default", max_retries=1)
+def rebalance_portfolio_task(self, job_id: str):
+    """
+    Recompute HRP target allocation weights for a capital rebalance request.
+    Dispatched by capital_service.compute_rebalance() -- see that function for
+    why this exists (previously created a BacktestJob row and did nothing).
+    """
+    from app.services.quant_engine import compute_hrp_allocation
+
+    with SyncSession() as db:
+        job = db.get(BacktestJob, uuid.UUID(job_id))
+        if not job:
+            return {"error": "job_not_found"}
+
+        job.status = "RUNNING"
+        job.started_at = datetime.now(timezone.utc)
+        db.commit()
+
+        try:
+            positions = db.execute(
+                select(Position).where(
+                    Position.user_id == job.submitted_by,
+                    Position.is_open.is_(True),
+                )
+            ).scalars().all()
+
+            sym_ids = list({p.symbol_id for p in positions})
+            sym_map = {}
+            if sym_ids:
+                for s in db.execute(select(Symbol).where(Symbol.id.in_(sym_ids))).scalars().all():
+                    sym_map[s.id] = s
+
+            asset_exposure: dict[str, float] = {}
+            for p in positions:
+                sym = sym_map.get(p.symbol_id)
+                if not sym:
+                    continue
+                base = sym.base_asset.upper()
+                asset_exposure[base] = asset_exposure.get(base, 0) + float(p.qty) * float(p.avg_cost)
+
+            returns_matrix: dict[str, list[float]] = {}
+            for sym_obj in db.execute(select(Symbol).where(Symbol.is_active.is_(True))).scalars().all():
+                base = sym_obj.base_asset.upper()
+                if base not in asset_exposure:
+                    continue
+                ticks = db.execute(
+                    select(MarketTick)
+                    .where(MarketTick.symbol_id == sym_obj.id)
+                    .order_by(MarketTick.time.desc())
+                    .limit(100)
+                ).scalars().all()
+                t_list = list(reversed(ticks))
+                if len(t_list) >= 10:
+                    prices = [float(t.price) for t in t_list]
+                    returns_matrix[base] = list(np.diff(np.log(np.array(prices) + 1e-10)))
+
+            if len(returns_matrix) >= 2:
+                target_weights = compute_hrp_allocation(returns_matrix)
+            else:
+                n = max(len(asset_exposure), 1)
+                target_weights = {k: 1.0 / n for k in asset_exposure}
+
+            job.full_report = {
+                "type": "REBALANCE",
+                "target_weights": target_weights,
+                "asset_exposure_usd": asset_exposure,
+            }
+            job.status = "COMPLETE"
+            job.progress_pct = 100
+            job.completed_at = datetime.now(timezone.utc)
+            db.commit()
+            return {"job_id": job_id, "target_weights": target_weights}
+
+        except Exception as e:
+            job.status = "FAILED"
+            job.error_message = str(e)
+            db.commit()
+            log.error(f"rebalance_portfolio_task error: {e}", exc_info=True)
+            return {"error": str(e)}
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _simulate_fold(prices, regime, daily_vol, ofi, cost_model):

@@ -94,7 +94,8 @@ class Settings(BaseSettings):
     RETAIN_CANDLES_1M_DAYS: int = 90
     RETAIN_CANDLES_1H_DAYS: int = 730
     RETAIN_DQ_EVENTS_DAYS: int = 30
- 
+    RETAIN_MARKET_TICKS_HOURS: int = 48   # raw ticks are high-volume; short window vs. candles
+
     # ── Aggregation ───────────────────────────────────────────
     CANDLE_INTERVAL_SECONDS: int = 60
  

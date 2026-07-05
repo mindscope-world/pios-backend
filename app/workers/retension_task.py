@@ -8,10 +8,12 @@ Runs two loops concurrently:
   2. Daily pruning:   delete rows older than retention window
 
 Retention policy:
-  candles_1m    90 days   (config: RETAIN_CANDLES_1M_DAYS)
-  candles_1h   730 days   (config: RETAIN_CANDLES_1H_DAYS)
-  dq_events     30 days   (config: RETAIN_DQ_EVENTS_DAYS)
-  market_tick   forever   (intelligence, sparse — never pruned here)
+  candles_1m     90 days   (config: RETAIN_CANDLES_1M_DAYS)
+  candles_1h    730 days   (config: RETAIN_CANDLES_1H_DAYS)
+  dq_events      30 days   (config: RETAIN_DQ_EVENTS_DAYS)
+  market_ticks   48 hours  (config: RETAIN_MARKET_TICKS_HOURS) — high-volume raw
+                            ticks, kept only long enough for tick-level analytics
+                            (OFI, LOF, regime); candles are the long-term record.
 
 EC2 notes:
   - Both loops use raw SQL (no ORM overhead) for bulk deletes
@@ -81,9 +83,10 @@ async def _prune_tables() -> None:
     """Delete rows older than retention window from time-series tables."""
     now = datetime.now(timezone.utc)
     policy = {
-        "candles_1m": timedelta(days=settings.RETAIN_CANDLES_1M_DAYS),
-        "candles_1h": timedelta(days=settings.RETAIN_CANDLES_1H_DAYS),
-        "dq_events":  timedelta(days=settings.RETAIN_DQ_EVENTS_DAYS),
+        "candles_1m":   timedelta(days=settings.RETAIN_CANDLES_1M_DAYS),
+        "candles_1h":   timedelta(days=settings.RETAIN_CANDLES_1H_DAYS),
+        "dq_events":    timedelta(days=settings.RETAIN_DQ_EVENTS_DAYS),
+        "market_ticks": timedelta(hours=settings.RETAIN_MARKET_TICKS_HOURS),
     }
     try:
         async with get_engine().connect() as conn:

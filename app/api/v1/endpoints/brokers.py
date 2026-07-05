@@ -58,12 +58,7 @@ async def add_broker(
     Traders register their own broker connection.
     Credentials are AES-256 encrypted before storage.
     """
-    print(f"Data: {data}")
-    
     broker = await create_broker(db, data, current_user.id)
-    print(f"Created broker2 {broker.name} for user {current_user.email}")
-    print(f"Broker config2: {broker.config}")
-    print(f"Data2: {data}")
     await write_audit(
         db, "BROKER_ADDED", "broker", str(broker.id),
         actor_id=current_user.id, actor_email=current_user.email,

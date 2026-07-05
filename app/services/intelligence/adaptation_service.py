@@ -150,9 +150,15 @@ async def compute_adaptation_drift(db: AsyncSession, periods: int = 8) -> list[d
     primary = await primary_symbol(db)
 
     output = []
-    for i, job in enumerate(jobs):
+    for job in jobs:
         bt_sharpe = float(job.sharpe_ratio or 0)
 
+        # Real live Sharpe from the primary symbol's recent tick returns (the
+        # best real signal available -- there's no per-strategy PnLSnapshot
+        # history yet to compare against instead). No synthetic fallback: when
+        # there isn't enough real data, report None rather than a plausible-
+        # looking number derived from the backtest Sharpe itself.
+        live_sharpe = None
         if primary and job.completed_at:
             window_ticks = await recent_ticks(db, primary.id, 50)
             rets = [
@@ -161,15 +167,17 @@ async def compute_adaptation_drift(db: AsyncSession, periods: int = 8) -> list[d
                 for k in range(1, min(len(window_ticks), 20))
                 if float(window_ticks[k - 1].price) > 0
             ]
-            live_sharpe = sharpe(rets)
-        else:
-            live_sharpe = bt_sharpe * (0.85 + 0.1 * i / max(len(jobs), 1))
+            if len(rets) >= 2:
+                live_sharpe = sharpe(rets)
 
-        conf = round(min(100, max(0, 100 - abs(live_sharpe - bt_sharpe) * 30)), 1)
+        conf = (
+            round(min(100, max(0, 100 - abs(live_sharpe - bt_sharpe) * 30)), 1)
+            if live_sharpe is not None else None
+        )
         output.append({
             "user_id":          str(job.submitted_by),  # kept for channel-level filtering
             "ts":               (job.completed_at or job.created_at).isoformat(),
-            "live_sharpe":      round(live_sharpe, 4),
+            "live_sharpe":      round(live_sharpe, 4) if live_sharpe is not None else None,
             "backtest_sharpe":  round(bt_sharpe, 4),
             "confidence_pct":   conf,
         })
