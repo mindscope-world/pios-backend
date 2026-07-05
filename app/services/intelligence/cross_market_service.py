@@ -159,7 +159,14 @@ async def compute_gmig_enhanced(
     Fetches BTC, ETH, Gold (GLD), S&P 500 (SPY), DXY proxy, Oil (USO)
     and computes real-time correlations + causal graph.
     """
-    
+
+    # DB-based correlations from ticks
+    sym_result = await db.execute(
+        select(Symbol)
+        .where(Symbol.is_active.is_(True), Symbol.asset_class == "forex")
+    )
+    symbols    = sym_result.scalars().all()
+
     # Parallel live ticker fetch across active forex symbols using OANDA
     forex_symbols = [s.symbol for s in symbols if s.asset_class == "forex"][:6]
 
@@ -179,13 +186,6 @@ async def compute_gmig_enhanced(
     for r in results:
         if isinstance(r, tuple) and r[1].get("last"):
             live_prices[r[0]] = float(r[1]["last"])
-
-    # DB-based correlations from ticks
-    sym_result = await db.execute(
-        select(Symbol)
-        .where(Symbol.is_active.is_(True), Symbol.asset_class == "forex")
-    )
-    symbols    = sym_result.scalars().all()
 
     price_series: dict[str, list[float]] = {}
     for sym in symbols:

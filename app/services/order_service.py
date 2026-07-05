@@ -169,7 +169,10 @@ async def cancel_order(
 ) -> Order:
     result = await db.execute(
         select(Order)
-        .options(selectinload(Order.broker))
+        # events must be eager-loaded: Order.transition() appends to it, and an
+        # implicit lazy-load on a freshly-queried async ORM object raises
+        # MissingGreenlet rather than silently fetching it.
+        .options(selectinload(Order.broker), selectinload(Order.events))
         .where(Order.id == order_id)
     )
     order = result.scalar_one_or_none()

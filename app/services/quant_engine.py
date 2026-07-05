@@ -1089,12 +1089,12 @@ def build_gmig_graph(price_series: dict[str, list[float]]) -> dict:
     symbols = list(price_series.keys())
     n = len(symbols)
     if n < 2:
-        return {"relationships": [], "gnn_confidence": 0.5, "graph_nodes": n}
+        return {"relationships": [], "gnn_confidence": 0.5, "graph_nodes": n, "graph_edges": 0}
 
     # Align all series to minimum length
     min_len = min(len(v) for v in price_series.values())
     if min_len < 10:
-        return {"relationships": [], "gnn_confidence": 0.5, "graph_nodes": n}
+        return {"relationships": [], "gnn_confidence": 0.5, "graph_nodes": n, "graph_edges": 0}
 
     ret_matrix = {}
     for sym, prices in price_series.items():

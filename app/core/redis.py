@@ -42,6 +42,20 @@ async def redis_get_json(key: str):
     return orjson.loads(data) if data else None
 
 
+async def get_intelligence_key(key_prefix: str, symbol: str) -> Optional[dict]:
+    """
+    Fetch a symbol-keyed intelligence payload written by app/workers/intelligence_worker.py.
+
+    intelligence_worker.py writes keys as f"{prefix}:{normalize_symbol(symbol)}" (e.g.
+    "decision_feed:BTCUSDT" -- slashes stripped, no user id). `symbol` here must already
+    be in that normalized form; callers resolve it via primary_symbol()/a symbol query
+    param before calling this.
+
+    Returns None if the worker hasn't populated this key yet (cache miss / expired TTL).
+    """
+    return await redis_get_json(f"{key_prefix}:{symbol}")
+
+
 async def redis_publish(channel: str, value: Any):
     r = get_redis()
     await r.publish(channel, orjson.dumps(value))

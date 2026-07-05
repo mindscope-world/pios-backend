@@ -16,7 +16,6 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import AsyncGenerator
 
-from gitdb import db
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
@@ -24,14 +23,18 @@ from sqlalchemy import func, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
-from app.core.redis import get_redis
+from app.core.redis import get_intelligence_key
 from app.db.session import get_db
 from app.helpers.helpers import get_symbol_by_name, latest_regime, open_positions, primary_symbol, recent_ticks, safe_ms
 from app.models.all_models import (
     MarketTick, Symbol, RegimeState, Position, Order,
     Strategy, BacktestJob, Fill, PnLSnapshot, Alert, User,
 )
-from app.services.intelligence.montecarlo_service import compute_monte_carlo
+from app.services.intelligence.decision_service import compute_decision_current
+from app.services.intelligence.montecarlo_service import compute_monte_carlo, compute_monte_carlo_auto
+from app.services.intelligence.ofi_service import compute_ofi, compute_ofi_chart, compute_ofi_signal_auto
+from app.services.intelligence.signal_conflict_service import compute_signal_conflict, compute_signal_conflict_auto
+from app.services.intelligence.cross_market_service import compute_gmig_enhanced
 from app.services.market_data_service import (
     get_live_ticker, get_ohlcv, get_orderbook, get_recent_trades,
     compute_technical_indicators, get_multi_asset_snapshot,
@@ -42,30 +45,81 @@ from app.services.market_data_service import (
 
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
 
+
+def _normalize_symbol_key(symbol: str) -> str:
+    """Matches app/workers/intelligence_worker.py's normalize_symbol() -- Redis
+    keys are written with slashes stripped, e.g. "BTC/USDT" -> "BTCUSDT"."""
+    return symbol.replace("/", "")
+
+
+async def _resolve_symbol_key(db: AsyncSession, symbol: str | None) -> str | None:
+    """
+    Resolve a symbol query param (or the DB's primary symbol if none given) to the
+    normalized form intelligence_worker.py uses as its Redis key suffix. Returns
+    None if there's no symbol to resolve to (no param and no primary symbol yet).
+    """
+    if symbol:
+        return _normalize_symbol_key(symbol)
+    sym_db = await primary_symbol(db)
+    return _normalize_symbol_key(sym_db.symbol) if sym_db else None
+
+
+async def _get_worker_cached(key_prefix: str, db: AsyncSession, symbol: str | None) -> dict:
+    """
+    Shared fetch path for the intelligence_worker.py-populated Redis endpoints below.
+    Returns the cached payload, or a clean {"error": ...} dict (never raises) if the
+    symbol can't be resolved or the worker hasn't populated this key yet.
+    """
+    key = await _resolve_symbol_key(db, symbol)
+    if not key:
+        return {"error": "no_market_data"}
+    data = await get_intelligence_key(key_prefix, key)
+    return data if data is not None else {"error": "not_yet_computed", "symbol": key}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # § 1  DECISION CONTEXT
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/decision/current")
-async def descision_current(user=Depends(get_current_user)):
-    return await get_redis("descision_current", user.id)
+async def descision_current(
+    symbol: str | None = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Full quant-core decision pipeline, computed live (not worker-cached)."""
+    return await compute_decision_current(current_user, db, symbol=symbol)
 
 @router.get("/decision/feed")
-async def decision_feed(user=Depends(get_current_user)):
-    return await get_redis("decision_feed", user.id)
+async def decision_feed(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("decision_feed", db, symbol)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 2  REGIME
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/regime/current")
-async def regime_current(user=Depends(get_current_user)):
-    return await get_redis("regime_current", user.id)
+async def regime_current(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # intelligence_worker.py stores compute_regime_current()'s output under the
+    # "regime_history" key prefix (its own local variable is named regime_history).
+    return await _get_worker_cached("regime_history", db, symbol)
 
 
 @router.get("/regime/trend")
-async def regime_trend(user=Depends(get_current_user)):
-    return await get_redis("regime_trend", user.id)
+async def regime_trend(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("regime_trend", db, symbol)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,12 +127,23 @@ async def regime_trend(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/ofi")
-async def ofi_signal(user=Depends(get_current_user)):
-    return await get_redis("ofi_signal", user.id)
+async def ofi_signal(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # intelligence_worker.py stores compute_ofi()'s output under "order_flow".
+    return await _get_worker_cached("order_flow", db, symbol)
 
 @router.get("/ofi/chart")
-async def ofi_chart(user=Depends(get_current_user)):
-    return await get_redis("ofi_chart", user.id)
+async def ofi_chart(
+    symbol: str | None = Query(None, description="Optional -- auto-selects most active"),
+    limit: int = Query(60, ge=10, le=500),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Not worker-cached -- computed live per request."""
+    return await compute_ofi_chart(current_user, db, symbol=symbol, limit=limit)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,13 +151,21 @@ async def ofi_chart(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/gmig/snapshot")
-async def gmig_snapshot(user=Depends(get_current_user)):
-    return await get_redis("gmig_snapshot", user.id)
+async def gmig_snapshot(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("gmig_snapshot", db, symbol)
 
 
 @router.get("/gmig/radar")
-async def gmig_radar(user=Depends(get_current_user)):
-    return await get_redis("gmig_radar", user.id)
+async def gmig_radar(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("gmig_radar", db, symbol)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,8 +173,17 @@ async def gmig_radar(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/montecarlo")
-async def monte_carlo(user=Depends(get_current_user)):
-    return await get_redis("montecarlo", user.id)
+async def monte_carlo(
+    symbol: str | None = Query(None),
+    simulations: int = Query(2000, ge=100, le=5000),
+    horizon_days: int = Query(30, ge=5, le=90),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Not worker-cached -- computed live per request."""
+    return await compute_monte_carlo(
+        current_user, db, symbol=symbol, simulations=simulations, horizon_days=horizon_days,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,18 +191,30 @@ async def monte_carlo(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/adaptation/feed")
-async def adaptation_feed(user=Depends(get_current_user)):
-    return await get_redis("adaptation_feed", user.id)
+async def adaptation_feed(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("adaptation_feed", db, symbol)
 
 
 @router.get("/adaptation/active")
-async def adaptation_active(user=Depends(get_current_user)):
-    return await get_redis("adaptation_active", user.id)
+async def adaptation_active(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("adaptation_active", db, symbol)
 
 
 @router.get("/adaptation/drift")
-async def adaptation_drift(user=Depends(get_current_user)):
-    return await get_redis("adaptation_drift", user.id)
+async def adaptation_drift(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("adaptation_drift", db, symbol)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,13 +222,23 @@ async def adaptation_drift(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/alpha/state")
-async def alpha_factory_state(user=Depends(get_current_user)):
-    return await get_redis("alpha_factory_state", user.id)
+async def alpha_factory_state(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # intelligence_worker.py stores compute_alpha_factory_state()'s output under
+    # the "alpha_state" key prefix (its own local variable is named alpha_state).
+    return await _get_worker_cached("alpha_state", db, symbol)
 
 
 @router.get("/alpha/darwin")
-async def alpha_darwin(user=Depends(get_current_user)):
-    return await get_redis("alpha_darwin", user.id)
+async def alpha_darwin(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("alpha_darwin", db, symbol)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,8 +246,12 @@ async def alpha_darwin(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/signal-conflict")
-async def signal_conflict(user=Depends(get_current_user)):
-    return await get_redis("signal_conflict", user.id)
+async def signal_conflict(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Not worker-cached -- computed live per request (auto-detects primary symbol)."""
+    return await compute_signal_conflict(current_user, db)
 
 
 @router.get("/rejection-stats")
@@ -189,8 +297,12 @@ async def rejection_stats(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/features")
-async def features(user=Depends(get_current_user)):
-    return await get_redis("features", user.id)
+async def features(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("features", db, symbol)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,8 +310,12 @@ async def features(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/command-center/current")
-async def command(user=Depends(get_current_user)):
-    return await get_redis("command_center", user.id)
+async def command(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("command_center", db, symbol)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,8 +373,12 @@ async def quant_core_gates(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/scenarios/simulations")
-async def scenarios_simulations(user=Depends(get_current_user)):
-    return await get_redis("scenarios", user.id)
+async def scenarios_simulations(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("scenarios", db, symbol)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -266,24 +386,40 @@ async def scenarios_simulations(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/traces")
-async def decision_traces(user=Depends(get_current_user)):
-    return await get_redis("decision_traces", user.id)
+async def decision_traces(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("decision_traces", db, symbol)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § UPDATED — WHY NOT TRADE  /intelligence/why-not-trade  (no required params)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/ofi/auto")
-async def ofi_auto_signal(user=Depends(get_current_user)):
-    return await get_redis("ofi_auto_signal", user.id) 
+async def ofi_auto_signal(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Not worker-cached -- auto-detects primary symbol, no params required."""
+    return await compute_ofi_signal_auto(current_user, db)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § UPDATED — MONTE CARLO (no required symbol param)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/montecarlo/auto")
-async def monte_carlo_auto(user=Depends(get_current_user)):
-    return await get_redis("monte_carlo_auto", user.id)
+async def monte_carlo_auto(
+    simulations: int = Query(2000, ge=100, le=5000),
+    horizon_days: int = Query(30, ge=5, le=90),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Not worker-cached -- auto-detects primary symbol, no symbol param required."""
+    return await compute_monte_carlo_auto(
+        current_user, db, simulations=simulations, horizon_days=horizon_days,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -291,8 +427,12 @@ async def monte_carlo_auto(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/signal-conflict/auto")
-async def signal_conflict_auto(user=Depends(get_current_user)):
-    return await get_redis("signal_conflict_auto", user.id)
+async def signal_conflict_auto(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Not worker-cached -- auto-detects primary symbol, no params required."""
+    return await compute_signal_conflict_auto(current_user, db)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -541,16 +681,29 @@ async def market_funding(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/ofi/enhanced")
-async def ofi_enhanced(user=Depends(get_current_user)):
-    return await get_redis("ofi_enhanced", user.id)
+async def ofi_enhanced(
+    symbol: str | None = Query(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    compute_ofi() already *is* the enhanced version (DB tick history + live L2
+    orderbook + recent trade tape) -- see ofi_service.compute_ofi's docstring.
+    Computed live per request rather than worker-cached, for freshness.
+    """
+    return await compute_ofi(current_user, db, symbol=symbol)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENHANCED GMIG — with live cross-market prices
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/gmig/enhanced")
-async def gmig_enhanced(user=Depends(get_current_user)):
-    return await get_redis("gmig_enhanced", user.id)
+async def gmig_enhanced(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Not worker-cached -- computed live per request."""
+    return await compute_gmig_enhanced(current_user, db)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -558,8 +711,12 @@ async def gmig_enhanced(user=Depends(get_current_user)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/why-not-trade")
-async def why_not_trade(user=Depends(get_current_user)):
-    return await get_redis("why_not_trade", user.id)
+async def why_not_trade(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _get_worker_cached("why_not_trade", db, symbol)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # WEBSOCKET — Real-time price stream

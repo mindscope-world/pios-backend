@@ -15,44 +15,70 @@ import uuid
 from datetime import datetime, timezone, timedelta, date
 
 import numpy as np
+import structlog
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.all_models import (
     Order, Position, KillSwitchEvent, RiskLimit, Alert,
-    Fill, PnLSnapshot, MarketTick, User
+    Fill, PnLSnapshot, MarketTick,
 )
 from app.schemas.all_schemas import RiskMetricsOut, KillSwitchRequest
 from app.services.audit_service import write_audit
+from app.services.broker_service import get_adapter
 from app.core.config import settings
 
+logger = structlog.get_logger()
 
+
+# NOTE: parameter order/typing follows the rest of the codebase's endpoint->service
+# convention (db first, primitives for the acting user) -- see order_service.py's
+# submit_order/cancel_order. Keep new service functions in this file consistent with
+# this so a future mismatch with the call site fails at review time, not at runtime.
 async def trigger_kill_switch(
-    current_user: User,
     db: AsyncSession,
     data: KillSwitchRequest,
+    user_id: uuid.UUID,
     user_email: str,
 ) -> KillSwitchEvent:
-    """Cancel all open orders + mark positions closed. Atomic."""
+    """Cancel all open orders (DB + broker) and mark positions closed. Atomic."""
     open_orders = (await db.execute(
-        select(Order).where(
-            Order.user_id == current_user.id,
+        select(Order)
+        # events must be eager-loaded: Order.transition() appends to it, and an
+        # implicit lazy-load on a freshly-queried async ORM object raises
+        # MissingGreenlet rather than silently fetching it.
+        .options(selectinload(Order.broker), selectinload(Order.events))
+        .where(
+            Order.user_id == user_id,
             Order.status.in_(["NEW", "SUBMITTED", "PARTIAL"]),
         )
     )).scalars().all()
     for order in open_orders:
+        if order.broker_order_id:
+            try:
+                adapter = get_adapter(order.broker)
+                await adapter.cancel_order(order.broker_order_id)
+            except Exception:
+                # One broker failure shouldn't abort the sweep -- the order is still
+                # marked cancelled locally below and the kill switch keeps going.
+                logger.warning(
+                    "kill_switch_broker_cancel_failed",
+                    order_id=str(order.id), broker_id=str(order.broker_id),
+                    exc_info=True,
+                )
         order.transition("CANCELLED", "Kill switch triggered")
         order.cancelled_at = datetime.now(timezone.utc)
 
     open_positions = (await db.execute(
-        select(Position).where(Position.user_id == current_user.id, Position.is_open.is_(True))
+        select(Position).where(Position.user_id == user_id, Position.is_open.is_(True))
     )).scalars().all()
     for pos in open_positions:
         pos.is_open   = False
         pos.closed_at = datetime.now(timezone.utc)
 
     event = KillSwitchEvent(
-        triggered_by     = current_user.id,
+        triggered_by     = user_id,
         trigger_source   = "manual",
         reason           = data.reason,
         orders_cancelled = len(open_orders),
@@ -69,25 +95,25 @@ async def trigger_kill_switch(
     await db.flush()
     await write_audit(
         db, action="KILL_SWITCH", resource_type="system",
-        resource_id=str(event.id), actor_id=current_user.id, actor_email=user_email,
+        resource_id=str(event.id), actor_id=user_id, actor_email=user_email,
         after_state={"orders_cancelled": len(open_orders), "positions_closed": len(open_positions)},
     )
     return event
 
 
-async def compute_risk_metrics(current_user: User, db: AsyncSession) -> RiskMetricsOut:
+async def compute_risk_metrics(db: AsyncSession, user_id: uuid.UUID) -> RiskMetricsOut:
     """
     Compute live risk metrics.
     VaR/CVaR from historical PnL return distribution (scipy/numpy).
     Falls back to GARCH parametric VaR if insufficient history.
     """
     positions = (await db.execute(
-        select(Position).where(Position.user_id == current_user.id, Position.is_open.is_(True))
+        select(Position).where(Position.user_id == user_id, Position.is_open.is_(True))
     )).scalars().all()
 
     snap = (await db.execute(
         select(PnLSnapshot)
-        .where(PnLSnapshot.user_id == current_user.id)
+        .where(PnLSnapshot.user_id == user_id)
         .order_by(PnLSnapshot.snapshot_at.desc())
         .limit(1)
     )).scalar_one_or_none()
@@ -97,7 +123,7 @@ async def compute_risk_metrics(current_user: User, db: AsyncSession) -> RiskMetr
     snaps_30d = (await db.execute(
         select(PnLSnapshot)
         .where(
-            PnLSnapshot.user_id == current_user.id,
+            PnLSnapshot.user_id == user_id,
             PnLSnapshot.snapshot_at >= datetime.now(timezone.utc) - timedelta(days=30),
         )
         .order_by(PnLSnapshot.snapshot_at)
@@ -149,7 +175,7 @@ async def compute_risk_metrics(current_user: User, db: AsyncSession) -> RiskMetr
     today_fills = (await db.execute(
         select(Fill)
         .join(Order, Fill.order_id == Order.id)
-        .where(Order.user_id == current_user.id, Fill.filled_at >= today_start)
+        .where(Order.user_id == user_id, Fill.filled_at >= today_start)
     )).scalars().all()
     daily_pnl = -sum(float(f.commission) + float(f.funding_cost) for f in today_fills)
 
@@ -181,7 +207,7 @@ async def compute_risk_metrics(current_user: User, db: AsyncSession) -> RiskMetr
 
     triggers_today = (await db.execute(
         select(func.count(KillSwitchEvent.id))
-        .where(KillSwitchEvent.triggered_by == current_user.id, KillSwitchEvent.created_at >= today_start)
+        .where(KillSwitchEvent.triggered_by == user_id, KillSwitchEvent.created_at >= today_start)
     )).scalar_one() or 0
 
     return RiskMetricsOut(

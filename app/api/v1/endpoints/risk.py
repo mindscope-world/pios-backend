@@ -22,6 +22,8 @@ async def risk_metrics(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # compute_risk_metrics(db, user_id) -- db first, matching order_service.py's
+    # endpoint->service convention. Keep this call site and the service signature in sync.
     return await compute_risk_metrics(db, current_user.id)
 
 
@@ -122,6 +124,8 @@ async def kill_switch(
     elif admin.mfa_enabled and not data.mfa_code:
         raise HTTPException(status_code=400, detail="MFA code required for kill switch")
 
+    # trigger_kill_switch(db, data, user_id, user_email) -- db first, matching
+    # order_service.py's endpoint->service convention.
     event = await trigger_kill_switch(db, data, admin.id, admin.email)
     await db.commit()
     return event
