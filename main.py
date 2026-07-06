@@ -19,6 +19,7 @@ from app.api.v1.router import api_router
 from app.core.pubsub import start_redis_listener
 from app.db.session import engine, Base
 from app.models.all_models import InvalidTransitionError
+from app.services.broker_service import UnsupportedBrokerError
 
 logger = structlog.get_logger()
 
@@ -73,6 +74,10 @@ def create_app() -> FastAPI:
     @app.exception_handler(InvalidTransitionError)
     async def invalid_transition_handler(request: Request, exc: InvalidTransitionError):
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(UnsupportedBrokerError)
+    async def unsupported_broker_handler(request: Request, exc: UnsupportedBrokerError):
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
 
     # Prometheus metrics at /metrics
     Instrumentator().instrument(app).expose(app)

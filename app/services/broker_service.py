@@ -216,11 +216,42 @@ ADAPTER_MAP = {
 }
 
 
+class UnsupportedBrokerError(Exception):
+    """
+    Raised when a broker's type has no real adapter implementation (IBKR,
+    OANDA, LMAX, MT5, CUSTOM today) and the broker wasn't explicitly marked
+    is_paper=True. Without this, get_adapter() used to silently return
+    PaperAdapter for any unmapped type -- a user configuring a real "IBKR"
+    connection with is_paper=False would unknowingly get fake instant fills.
+    """
+    def __init__(self, broker_type: str):
+        self.broker_type = broker_type
+        super().__init__(
+            f"Broker type {broker_type!r} has no real adapter implementation yet "
+            f"(supported: {sorted(k for k in ADAPTER_MAP if k != 'PAPER')}). "
+            f"Set is_paper=true on this broker connection to use simulated fills "
+            f"until a real adapter ships."
+        )
+
+
 def get_adapter(broker: Broker) -> BrokerAdapter:
-    """Decrypt credentials and instantiate the correct adapter."""
+    """
+    Decrypt credentials and instantiate the correct adapter.
+
+    Unmapped broker types (no real adapter) only fall back to PaperAdapter when
+    the broker was explicitly created with is_paper=True -- otherwise this
+    raises UnsupportedBrokerError rather than silently faking fills.
+    """
     creds_json = decrypt_credentials(broker.credentials_enc)
     creds = json.loads(creds_json)
-    adapter_cls = ADAPTER_MAP.get(broker.broker_type.upper(), PaperAdapter)
+
+    broker_type = broker.broker_type.upper()
+    adapter_cls = ADAPTER_MAP.get(broker_type)
+    if adapter_cls is None:
+        if not broker.is_paper:
+            raise UnsupportedBrokerError(broker_type)
+        adapter_cls = PaperAdapter  # explicitly acknowledged as simulated
+
     return adapter_cls(broker, creds)
 
 
@@ -239,6 +270,12 @@ async def get_broker_or_404(db: AsyncSession, broker_id: uuid.UUID, owner_id: uu
 
 
 async def create_broker(db: AsyncSession, data: BrokerCreate, owner_id: uuid.UUID) -> Broker:
+    # Fail fast at creation time rather than only discovering at test/order time
+    # that an unsupported broker type was silently going to fake-fill trades.
+    broker_type = data.broker_type.upper()
+    if broker_type not in ADAPTER_MAP and not data.is_paper:
+        raise UnsupportedBrokerError(broker_type)
+
     creds_enc = encrypt_credentials(json.dumps(data.credentials.model_dump()))
     broker = Broker(
         owner_id=owner_id,

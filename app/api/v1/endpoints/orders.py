@@ -27,6 +27,12 @@ async def create_order(
     """
     Submit a new order. Runs risk gate before sending to broker.
     Supports: MARKET, LIMIT, STOP, STOP_LIMIT, OCO, TWAP, VWAP, ICEBERG.
+
+    NOTE: OCO/TWAP/VWAP/ICEBERG have no slicing/algorithmic execution engine
+    yet -- they currently execute as market-order-equivalent (instant, full-
+    quantity fill), same as MARKET. Check the response's `execution_style`
+    field ("INSTANT" vs "ALGORITHMIC") rather than assuming the order_type
+    implies real algorithmic execution.
     """
     ip = request.client.host if request.client else None
     order = await submit_order(

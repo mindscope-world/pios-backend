@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 from typing import Any
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, computed_field, field_validator
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -84,6 +84,11 @@ class BrokerCreate(BaseModel):
     name: str
     broker_type: str
     exchange_id: str | None = None         # for CCXT
+    # Real adapters exist only for ALPACA/BINANCE/CCXT. For any other
+    # broker_type, is_paper=True (the default) is required -- it's the explicit
+    # acknowledgement that this connection will get simulated fills, not a real
+    # broker integration. Setting is_paper=false for an unsupported type is
+    # rejected (UnsupportedBrokerError) rather than silently faking fills.
     is_paper: bool = True
     credentials: BrokerCredentials
     config: dict = Field(default_factory=dict)
@@ -140,13 +145,23 @@ class OrderCreate(BaseModel):
     broker_id: uuid.UUID
     symbol: str
     side: str                              # BUY | SELL
-    order_type: str = "MARKET"             # MARKET|LIMIT|STOP|TWAP|VWAP|OCO|ICEBERG
+    # MARKET|LIMIT|STOP|STOP_LIMIT|TWAP|VWAP|OCO|ICEBERG -- NOTE: TWAP/VWAP/OCO/
+    # ICEBERG have no slicing/algorithmic execution engine yet and currently
+    # instant-fill exactly like MARKET (see OrderOut.execution_style below).
+    # Real execution algorithms are a planned Track B item, not yet built.
+    order_type: str = "MARKET"
     qty: float = Field(gt=0)
     price: float | None = None             # required for LIMIT / STOP_LIMIT
     stop_price: float | None = None
     time_in_force: str = "GTC"
     strategy_id: uuid.UUID | None = None
-    algo_config: dict | None = None        # TWAP/VWAP slice parameters
+    algo_config: dict | None = None        # TWAP/VWAP slice parameters (not yet consumed by any adapter)
+
+# Order types with a real slicing/algorithmic execution engine wired in.
+# Empty until Track B ships real TWAP/VWAP/POV/Iceberg/Sniper execution --
+# every order type instant-fills via the broker adapter today, MARKET included.
+# Update this set as each algorithm actually ships; nothing else needs to change.
+_ALGORITHMIC_ORDER_TYPES: set[str] = set()
 
 class OrderOut(BaseModel):
     model_config = {"from_attributes": True}
@@ -168,6 +183,18 @@ class OrderOut(BaseModel):
     submitted_at: datetime | None
     filled_at: datetime | None
     created_at: datetime
+
+    @computed_field
+    @property
+    def execution_style(self) -> str:
+        """
+        "INSTANT" = filled immediately by the broker adapter (every order type
+        today, including TWAP/VWAP/OCO/ICEBERG -- there is no slicing engine
+        yet, so these currently behave exactly like MARKET despite the label).
+        "ALGORITHMIC" is reserved for once a real execution algorithm exists
+        for this order_type.
+        """
+        return "ALGORITHMIC" if self.order_type in _ALGORITHMIC_ORDER_TYPES else "INSTANT"
 
 class FillOut(BaseModel):
     model_config = {"from_attributes": True}
