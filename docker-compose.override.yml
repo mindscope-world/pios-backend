@@ -1,0 +1,59 @@
+# Local dev override — auto-loaded by `docker compose` alongside
+# docker-compose.yml, no extra -f flag needed.
+#
+# The base file's `app` service (and everything that `extends` it: api,
+# worker, beat, ingestor, intelligence) pulls
+# registry.gitlab.com/gfunze/pios-backend/app, which is private and returns
+# "access forbidden" without registry credentials. This override builds that
+# same image locally from ./Dockerfile instead. `extends` resolves at
+# docker-compose.yml parse time, before override files are merged in, so
+# each service that extends `app` is overridden individually here rather
+# than relying on overriding `app` alone to propagate.
+#
+# db/redis need no changes: containers on the compose network resolve those
+# hostnames natively via Docker's internal DNS (DATABASE_HOST=db,
+# REDIS_URL=redis://redis:6379/0 from .env / the base file both just work).
+# The "gaierror: name resolution" error only happens when running uvicorn
+# bare on the host instead of inside this network — running `api` here
+# avoids that class of problem entirely.
+
+services:
+  app:
+    image: pios-backend-local:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  api:
+    image: pios-backend-local:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Bind-mount source for hot reload during local dev; --reload watches it.
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 9000 --reload
+
+  worker:
+    image: pios-backend-local:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  beat:
+    image: pios-backend-local:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  ingestor:
+    image: pios-backend-local:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+  intelligence:
+    image: pios-backend-local:latest
+    build:
+      context: .
+      dockerfile: Dockerfile

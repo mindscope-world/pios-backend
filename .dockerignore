@@ -4,3 +4,7 @@ __pycache__
 .git
 .vscode
 venv
+.venv
+.pytest_cache
+dist
+node_modules
