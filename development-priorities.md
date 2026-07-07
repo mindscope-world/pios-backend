@@ -27,6 +27,22 @@ This document outlines the prioritized feature development plan for PiOSQ to ach
 
 ---
 
+## Frontend-Driven Feature Requests (from client design mockup, 2026-07-06)
+
+The client supplied `pi-osq-execution-intelligence-v3.html` as the new frontend design + feature source of truth. Auditing it against this backend surfaced several UI concepts with **no backend support today** — not partial, entirely absent. Per the client's explicit decision, the frontend now renders these honestly as "not yet available" rather than simulating them, and they're recorded here as future backend work:
+
+| Feature | Mockup concept | Current backend gap |
+|---------|----------------|----------------------|
+| **Autonomous execution modes** | Semi-auto ("system entered trade, user can override/adjust") and Automatic ("trades entered and managed by the system") execution modes, with asymmetric mode-switch friction (manual→auto requires confirm, auto→manual is instant) | Every order is user-initiated via `POST /orders`. There is no autonomous order-submission engine — nothing evaluates a decision and submits an order on its own initiative. This is a large, high-risk, real-money-adjacent project (needs its own design: sizing authority, per-mode risk limits, audit trail, kill interaction), not an incremental addition. |
+| **System-triggered kill + resume checklist** | Kill switch has two distinct trigger paths (manual vs. system/model-initiated), with system-triggered pauses requiring a deliberate "review and resume" checklist before trading resumes; manual pauses resume with one click | `POST /risk/killswitch` is a one-shot cancel-all/close-all action, not a state toggle. `RiskMetricsOut.kill_switch_armed` is a static readiness flag, not a paused/active/resumable state. `KillSwitchEventOut.trigger_source` exists in the schema but only the literal `"manual"` value is ever written anywhere in the code — nothing currently triggers a kill switch autonomously, so system vs. manual can't be distinguished today even at the data level. |
+| **Concrete trade-setup fields** | Decision card shows Entry / Stop / Target / R:R / Risk% / Size for the current signal | No endpoint returns entry/stop/target price levels or a risk:reward ratio. `/intelligence/decision/current`, `/command-center/current`, and `/why-not-trade` return a decision (ALLOW/BLOCK/WAIT/REDUCE), confidence, and a sizing figure (`final_size_lot`) — no directional entry/exit levels. |
+| **Calibration digest** | 7-day audit aggregate: eligible setups taken vs. skipped, avg size vs. max allowed, rejection-reason breakdown (crowding / high difficulty / confidence / macro window / regime mismatch) | No aggregation endpoint exists. Per-symbol `/why-not-trade` and `/traces` are real and per-order, but nothing rolls them up into a rolling-window digest with a rejection-reason taxonomy. |
+| **Broker order success rate** | Per-broker and aggregate "execution health" (order success %, best latency path, 7d execution failures, avg slippage) | `BrokerOut` has `latency_p99_ms`/`status`/`error_message` (real) but no fill-success-rate rollup by broker; fills aren't currently attributed to a broker for aggregation. |
+
+None of these were built as client-side simulations in the current frontend — they're either omitted with an inline note, or (execution mode) shown as a real switch that renders an honest "not available" state for semi/automatic while Manual wires to the real order-submission path.
+
+---
+
 ## P0: CRITICAL PRIORITY (Start Immediately)
 
 ### 1. Mechanism Observatory (D3 Engine 7)

@@ -9,13 +9,13 @@ import contextlib
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 import structlog
 
 from app.core.config import settings
 from app.api.v1.router import api_router
+from app.core.middleware import ExcludePathsGZipMiddleware
 from app.core.pubsub import start_redis_listener
 from app.db.session import engine, Base
 from app.models.all_models import InvalidTransitionError
@@ -66,7 +66,14 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.add_middleware(
+        ExcludePathsGZipMiddleware,
+        excluded_paths={
+            "/api/v1/intelligence/stream",
+            "/api/v1/intelligence/notifications/stream",
+        },
+        minimum_size=1000,
+    )
 
     # Routes
     app.include_router(api_router, prefix="/api/v1")

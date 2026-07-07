@@ -84,6 +84,11 @@ async def update_limit(
                       before_state=before,
                       after_state={"value": float(limit.limit_value), "action": limit.breach_action})
     await db.commit()
+    # updated_at is DB-computed (onupdate=func.now(), no Python-side default) —
+    # commit() expires it along with every other attribute, so returning `limit`
+    # unrefreshed makes response serialization lazy-load it outside the async
+    # context and crash with MissingGreenlet. Refresh to pull the committed row.
+    await db.refresh(limit)
     return limit
 
 
