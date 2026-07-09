@@ -133,6 +133,12 @@ async def kill_switch(
     # order_service.py's endpoint->service convention.
     event = await trigger_kill_switch(db, data, admin.id, admin.email)
     await db.commit()
+    # Post-commit WS nudges: a P1 alert row was written and the admin's open
+    # orders/positions were force-closed (see trade_events.py).
+    from app.services.trade_events import publish_alert_event, publish_order_event, publish_position_event
+    await publish_alert_event(severity="P1", title=f"Kill switch triggered by {admin.email}")
+    await publish_order_event(admin.id, status="CANCELLED")
+    await publish_position_event(admin.id)
     return event
 
 

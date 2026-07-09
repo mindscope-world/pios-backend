@@ -15,7 +15,6 @@ MODULES = [
     "signal_conflict_service",
     "scenarios_service",
     "decision_service",
-    "indicators_service",
     "regime_service",
     "why_not_trade_service",
     "features_service",

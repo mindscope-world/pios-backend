@@ -49,8 +49,77 @@ except ImportError:
 try:
     import yfinance as yf
     YF_AVAILABLE = True
+    # yfinance logs every per-ticker failure at ERROR ("Failed to get ticker
+    # 'AAPL' ... JSONDecodeError", "1 Failed download:") — when Yahoo is
+    # rate-limiting (429) that's 7+ lines per Markets-tab load. The circuit
+    # breaker below is the real signal; the per-ticker spam is noise.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 except ImportError:
     YF_AVAILABLE = False
+
+# ── yfinance circuit breaker + thread offload ────────────────────────────────
+# Yahoo aggressively 429s unauthenticated clients; yf.download() then returns
+# an empty frame after burning seconds of retries — and it's a *blocking* call,
+# so invoking it inline from these async endpoints stalls the event loop for
+# every concurrent request. _yf_download() runs it in a worker thread and,
+# after _YF_TRIP_AFTER consecutive failures, stops calling Yahoo entirely for
+# _YF_COOLDOWN_S so a rate-limited environment degrades to fast, quiet
+# "equities unavailable" responses instead of slow, log-spamming ones.
+_YF_TRIP_AFTER = 3
+_YF_COOLDOWN_S = 600.0
+_yf_consecutive_failures = 0
+_yf_blocked_until = 0.0
+
+
+def _yf_ready() -> bool:
+    return YF_AVAILABLE and time.time() >= _yf_blocked_until
+
+
+async def _yf_download(*args, **kwargs):
+    """yf.download in a thread, feeding the circuit breaker. Returns the
+    DataFrame (possibly empty) or None when yfinance is tripped/unavailable."""
+    global _yf_consecutive_failures, _yf_blocked_until
+    if not _yf_ready():
+        return None
+    try:
+        df = await asyncio.to_thread(yf.download, *args, **kwargs)
+        failed = df is None or df.empty
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"yfinance download {args}: {e}")
+        failed = True
+        df = None
+    if failed:
+        _yf_consecutive_failures += 1
+        # Only trip+log once per outage window — downloads already in flight
+        # when the breaker trips also land here and shouldn't re-log.
+        if _yf_consecutive_failures >= _YF_TRIP_AFTER and time.time() >= _yf_blocked_until:
+            _yf_blocked_until = time.time() + _YF_COOLDOWN_S
+            log.warning(
+                "yfinance: %d consecutive failed downloads (Yahoo rate limit?) — "
+                "pausing equity data for %.0f min",
+                _yf_consecutive_failures, _YF_COOLDOWN_S / 60,
+            )
+        return None
+    _yf_consecutive_failures = 0
+    return df
+
+
+# ── Tiny in-process TTL cache ────────────────────────────────────────────────
+# get_market_breadth / get_multi_asset_snapshot fan out to several external
+# providers per call; every Markets-tab visitor re-triggering that is wasted
+# quota (and what got this environment 429'd by Yahoo in the first place).
+_ttl_cache: dict[str, tuple[float, Any]] = {}
+
+
+def _ttl_get(key: str, ttl_s: float):
+    hit = _ttl_cache.get(key)
+    if hit and time.time() - hit[0] < ttl_s:
+        return hit[1]
+    return None
+
+
+def _ttl_set(key: str, value: Any) -> None:
+    _ttl_cache[key] = (time.time(), value)
 
 try:
     import ta
@@ -405,15 +474,15 @@ async def get_ohlcv(
                 log.debug(f"OHLCV {ex_name}: {e}")
 
     # yfinance fallback for stocks / ETFs
-    if YF_AVAILABLE and not symbol.endswith("/USDT"):
+    if _yf_ready() and not symbol.endswith("/USDT"):
         try:
             interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "60m", "4h": "1h", "1d": "1d"}
             period_map   = {"1m": "1d", "5m": "5d", "15m": "5d", "1h": "1mo", "4h": "3mo", "1d": "1y"}
-            df = yf.download(
+            df = await _yf_download(
                 symbol, period=period_map.get(timeframe, "1mo"),
                 interval=interval_map.get(timeframe, "1h"), progress=False, auto_adjust=True,
             )
-            if not df.empty:
+            if df is not None and not df.empty:
                 return [
                     {"ts": int(idx.timestamp() * 1000), "time": idx.isoformat(),
                      "open": float(row["Open"]), "high": float(row["High"]),
@@ -814,6 +883,11 @@ async def get_multi_asset_snapshot(
     forex   = forex_pairs     or CORE_FOREX_PAIRS[:4]
     stocks  = stock_tickers   or CORE_STOCK_TICKERS[:4]
 
+    cache_key = f"snapshot:{','.join(crypto)}|{','.join(forex)}|{','.join(stocks)}"
+    cached = _ttl_get(cache_key, 60)
+    if cached is not None:
+        return cached
+
     async def crypto_snap(sym: str) -> dict | None:
         try:
             ex = _get_exchange(DEFAULT_CRYPTO_EXCHANGE)
@@ -847,11 +921,11 @@ async def get_multi_asset_snapshot(
             return None
 
     async def stock_snap(ticker: str) -> dict | None:
-        if not YF_AVAILABLE:
+        if not _yf_ready():
             return None
         try:
-            data = yf.download(ticker, period="2d", interval="1d", progress=False, auto_adjust=True)
-            if data.empty or len(data) < 2:
+            data = await _yf_download(ticker, period="2d", interval="1d", progress=False, auto_adjust=True)
+            if data is None or data.empty or len(data) < 2:
                 return None
             prev_close = float(data["Close"].iloc[-2])
             last_close = float(data["Close"].iloc[-1])
@@ -884,11 +958,13 @@ async def get_multi_asset_snapshot(
             r["up"] = (r.get("change_pct") or 0) >= 0
             items.append(r)
 
-    return {
+    snapshot = {
         "assets": items,
         "count":  len(items),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+    _ttl_set(cache_key, snapshot)
+    return snapshot
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -904,6 +980,10 @@ async def get_market_breadth() -> dict:
       - VIX level
       - Yield curve (10Y-2Y spread)
     """
+    cached = _ttl_get("breadth", 60)
+    if cached is not None:
+        return cached
+
     result = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -936,11 +1016,11 @@ async def get_market_breadth() -> dict:
         }
 
     # Equity indices via yfinance
-    if YF_AVAILABLE:
+    if _yf_ready():
         try:
-            indices = yf.download("^VIX ^GSPC ^TNX", period="2d", interval="1d",
-                                   progress=False, auto_adjust=True)
-            if not indices.empty:
+            indices = await _yf_download("^VIX ^GSPC ^TNX", period="2d", interval="1d",
+                                         progress=False, auto_adjust=True)
+            if indices is not None and not indices.empty:
                 spx = float(indices["Close"]["^GSPC"].iloc[-1])
                 vix = float(indices["Close"]["^VIX"].iloc[-1])
                 tny = float(indices["Close"]["^TNX"].iloc[-1])  # 10Y yield
@@ -958,6 +1038,7 @@ async def get_market_breadth() -> dict:
     # Fear & Greed proxy (simple RSI-based on BTC)
     result["fear_greed_proxy"] = _fear_greed_proxy(result)
 
+    _ttl_set("breadth", result)
     return result
 
 

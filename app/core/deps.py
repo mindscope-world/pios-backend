@@ -75,8 +75,15 @@ async def get_user_by_id(
 #     return user
 
 async def get_system_user(db: AsyncSession) -> User | None:
+    """
+    The service account the intelligence worker computes system-wide
+    snapshots as. Configurable via SYSTEM_USER_EMAIL (.env) rather than
+    hardcoded -- the account must exist in the users table; see
+    docs/RUNNING.md for how to seed it on a fresh environment.
+    """
+    from app.core.config import settings
     result = await db.execute(
-        select(User).where(User.email == "admin@pios.com")
+        select(User).where(User.email == settings.SYSTEM_USER_EMAIL)
     )
     return result.scalar_one_or_none()
 

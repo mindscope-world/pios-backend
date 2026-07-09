@@ -4,6 +4,7 @@ from app.core.redis import get_redis
 from app.services.websocket.manager import manager
 
 CHANNELS = [
+    "orders",
     "why_not_trade",
     "command_center",
     "scenarios",

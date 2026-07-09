@@ -18,11 +18,10 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     result_expires=86400,  # 24h
+    # Canonical beat schedule. backtest_worker.py adds its own entries via
+    # `.update()` on import — never reassign celery_app.conf.beat_schedule,
+    # or whichever module imports last wins and silently drops these.
     beat_schedule={
-        "darwin-weekly": {
-            "task": "darwin_evolution_cycle",
-            "schedule": crontab(hour=2, minute=0, day_of_week="sunday"),
-        },
         "snapshot-pnl-5min": {
             "task": "snapshot_pnl",
             "schedule": 300.0,  # every 5 minutes

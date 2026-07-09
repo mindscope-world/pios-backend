@@ -61,6 +61,17 @@ class Settings(BaseSettings):
     DEFAULT_DAILY_LOSS_LIMIT: float = 5000.0
     DEFAULT_MAX_POSITION_USD: float = 20000.0
     DEFAULT_MAX_LEVERAGE: float = 3.0
+    DEFAULT_MAX_OPEN_ORDERS: int = 50
+
+    # Paper-trading equity baseline for per-trader PnL snapshots and the
+    # portfolio-metrics fallback when a user has no snapshots yet.
+    DEFAULT_STARTING_EQUITY_USD: float = 100_000.0
+
+    # The service account the intelligence worker computes system-wide
+    # snapshots as (see app/workers/intelligence_worker.py). Must exist in
+    # the users table or the worker skips every symbol. Override per
+    # environment via SYSTEM_USER_EMAIL in .env.
+    SYSTEM_USER_EMAIL: str = "admin@pios.com"
 
     # Alpaca (stocks data + trading)
     ALPACA_API_KEY:    str = ""

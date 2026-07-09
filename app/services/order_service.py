@@ -5,19 +5,28 @@ Order lifecycle:
                  ↘ CANCELLED
                  ↘ REJECTED  (risk gate)
 """
+import asyncio
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.all_models import Order, Fill, Symbol, Broker, RiskLimit, Alert
-from app.schemas.all_schemas import OrderCreate, TCAReport
+from app.models.all_models import Order, Fill, Symbol, Broker, RiskLimit, Alert, OrderStatus
+from app.schemas.all_schemas import OrderCreate, TCAReport, _ALGORITHMIC_ORDER_TYPES
 from app.services.broker_service import get_adapter, get_broker_or_404
+from app.services.execution_algo import run_algo_order
 from app.services.audit_service import write_audit
+from app.services.positions_service import apply_fill_to_position, write_pnl_snapshot
 from app.core.config import settings
+
+# Strong references to in-flight algo-order background tasks -- asyncio only
+# holds a weak reference to a task once nothing else does, so without this a
+# fire-and-forget create_task() can get garbage-collected mid-schedule.
+_background_tasks: set[asyncio.Task] = set()
 
 
 # ── Risk gate ─────────────────────────────────────────────────────────────────
@@ -29,10 +38,12 @@ async def _risk_check(
     side: str,
     qty: float,
     price: float | None,
+    client_order_id: str | None = None,
 ) -> dict:
     """
     Run pre-trade risk checks. Returns a dict with passed=True/False.
-    Checks: max position size, daily loss limit, drawdown.
+    Checks: max position size, daily loss limit, drawdown, max open orders,
+    client_order_id idempotency.
     """
     notional = qty * (price or 0)
     checks = []
@@ -59,6 +70,29 @@ async def _risk_check(
     daily_limit = float(dl.limit_value) if dl else settings.DEFAULT_DAILY_LOSS_LIMIT
     checks.append({"check": "daily_loss", "passed": True, "limit": daily_limit})
 
+    # 3. Max open orders per user
+    open_result = await db.execute(
+        select(func.count()).select_from(Order).where(
+            Order.user_id == user_id,
+            Order.status.in_(OrderStatus.OPEN),
+        )
+    )
+    open_count = open_result.scalar_one()
+    max_open = settings.DEFAULT_MAX_OPEN_ORDERS
+    checks.append({"check": "max_open_orders", "passed": open_count < max_open, "value": open_count, "limit": max_open})
+
+    # 4. client_order_id idempotency — reject a retried key rather than
+    # silently double-submitting the same order to the broker.
+    if client_order_id:
+        dup_result = await db.execute(
+            select(Order.id).where(
+                Order.user_id == user_id,
+                Order.client_order_id == client_order_id,
+            )
+        )
+        dup = dup_result.scalar_one_or_none()
+        checks.append({"check": "idempotency", "passed": dup is None, "duplicate_order_id": str(dup) if dup else None})
+
     passed = all(c["passed"] for c in checks)
     return {"passed": passed, "checks": checks, "notional": notional}
 
@@ -82,10 +116,20 @@ async def submit_order(
     if not symbol:
         raise HTTPException(status_code=404, detail=f"Symbol '{data.symbol}' not found")
 
-    # 3. Risk gate
-    risk = await _risk_check(db, user_id, symbol, data.side, data.qty, data.price)
+    # 3. Risk gate. The idempotency check here is a fast-path SELECT --
+    # it catches a retried key immediately in the common case, but two
+    # requests carrying the same key racing concurrently can both pass it
+    # before either commits. The real guarantee is the partial unique
+    # index on (user_id, client_order_id) added by migration
+    # a1b2c3d4e5f6, enforced at the INSERT below.
+    risk = await _risk_check(db, user_id, symbol, data.side, data.qty, data.price, data.client_order_id)
     if not risk["passed"]:
         failed = [c for c in risk["checks"] if not c["passed"]]
+        if any(c["check"] == "idempotency" for c in failed):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Duplicate client_order_id {data.client_order_id!r}",
+            )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Risk gate rejected: {', '.join(c['check'] for c in failed)}",
@@ -94,7 +138,7 @@ async def submit_order(
     # 4. Create order record
     import uuid as _uuid
     order = Order(
-        client_order_id=f"PI-{_uuid.uuid4().hex[:8].upper()}",
+        client_order_id=data.client_order_id or f"PI-{_uuid.uuid4().hex[:8].upper()}",
         user_id=user_id,
         broker_id=broker.id,
         strategy_id=data.strategy_id,
@@ -111,39 +155,75 @@ async def submit_order(
     order.transition("SUBMITTED")
     order.submitted_at = datetime.now(timezone.utc)
     db.add(order)
-    await db.flush()
-
-    # 5. Send to broker
-    adapter = get_adapter(broker)
     try:
-        # Attach symbol for adapter use
-        order.symbol = symbol
-        broker_result = await adapter.submit_order(order)
-        order.broker_order_id = broker_result.get("broker_order_id")
-
-        # If paper/instant fill
-        if broker_result.get("status") == "FILLED":
-            fill_price = float(broker_result.get("avg_price") or data.price or 0)
-            fill = Fill(
-                order_id=order.id,
-                symbol_id=symbol.id,
-                side=data.side,
-                qty=data.qty,
-                price=fill_price,
-                commission=data.qty * fill_price * 0.001,  # 0.1% default
-                total_cost=data.qty * fill_price * 0.001,
+        await db.flush()
+    except IntegrityError as e:
+        await db.rollback()
+        if "ix_orders_user_client_order_id_unique" in str(e.orig):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Duplicate client_order_id {data.client_order_id!r}",
             )
-            db.add(fill)
-            order.filled_qty = data.qty
-            order.avg_fill_price = fill_price
-            order.transition("FILLED")
-            order.filled_at = datetime.now(timezone.utc)
-        else:
-            order.transition("SUBMITTED", "Sent to broker")
+        raise
 
-    except Exception as e:
-        order.transition("REJECTED", str(e))
-        order.reject_reason = str(e)
+    if data.order_type in _ALGORITHMIC_ORDER_TYPES:
+        # Algorithmic orders execute as a background slice schedule (see
+        # execution_algo.run_algo_order) rather than a single broker call --
+        # a real schedule can run for minutes, far longer than this request
+        # should block. The order stays SUBMITTED here with zero fills;
+        # the caller must call start_algo_execution(order.id) *after*
+        # committing this transaction (see start_algo_execution's docstring
+        # for why -- the background task reads via its own session and
+        # won't see an uncommitted row).
+        pass
+    else:
+        # 5. Send to broker (single-shot, instant fill/reject)
+        adapter = get_adapter(broker)
+        try:
+            # Attach symbol for adapter use
+            order.symbol = symbol
+            broker_result = await adapter.submit_order(order)
+            order.broker_order_id = broker_result.get("broker_order_id")
+
+            # If paper/instant fill
+            if broker_result.get("status") == "FILLED":
+                fill_price = float(broker_result.get("avg_price") or data.price or 0)
+                fill = Fill(
+                    order_id=order.id,
+                    symbol_id=symbol.id,
+                    side=data.side,
+                    qty=data.qty,
+                    price=fill_price,
+                    commission=data.qty * fill_price * 0.001,  # 0.1% default
+                    total_cost=data.qty * fill_price * 0.001,
+                )
+                db.add(fill)
+                order.filled_qty = data.qty
+                order.avg_fill_price = fill_price
+                order.transition("FILLED")
+                order.filled_at = datetime.now(timezone.utc)
+                # Net the fill into the trader's own Position row and append
+                # an equity-curve point -- Fill rows are the only source of
+                # per-trader positions, so this must happen wherever a Fill
+                # is written (algo slices do the same in execution_algo.py).
+                await apply_fill_to_position(
+                    db,
+                    user_id=user_id,
+                    broker_id=broker.id,
+                    strategy_id=data.strategy_id,
+                    symbol_id=symbol.id,
+                    side=data.side,
+                    qty=data.qty,
+                    price=fill_price,
+                    commission=fill.commission,
+                )
+                await write_pnl_snapshot(db, user_id)
+            else:
+                order.transition("SUBMITTED", "Sent to broker")
+
+        except Exception as e:
+            order.transition("REJECTED", str(e))
+            order.reject_reason = str(e)
 
     await db.flush()
 
@@ -156,6 +236,21 @@ async def submit_order(
     )
 
     return order
+
+
+def start_algo_execution(order_id: uuid.UUID) -> None:
+    """
+    Kick off an algorithmic order's background slice schedule. Must be
+    called only after the transaction that created/flushed the order has
+    committed -- run_algo_order opens its own DB session (AsyncSessionLocal,
+    not the request-scoped `db`) and won't see an uncommitted row, so
+    calling this before commit races the schedule against the commit and
+    the first slice silently no-ops. That's why submit_order() itself
+    doesn't call this; the router does, right after `await db.commit()`.
+    """
+    task = asyncio.create_task(run_algo_order(order_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 # ── Cancel order ──────────────────────────────────────────────────────────────
@@ -172,8 +267,21 @@ async def cancel_order(
         # events must be eager-loaded: Order.transition() appends to it, and an
         # implicit lazy-load on a freshly-queried async ORM object raises
         # MissingGreenlet rather than silently fetching it.
+        #
+        # with_for_update() row-locks the order for the rest of this
+        # transaction. Algorithmic orders (TWAP/VWAP/ICEBERG) have a
+        # background task committing fills to this same row from a separate
+        # session (execution_algo.run_algo_order, which takes the same
+        # lock per slice) -- without it, a slow adapter.cancel_order() call
+        # below can hold a stale in-memory snapshot while the background
+        # task fills the order underneath it, and the final commit here
+        # would overwrite status back to CANCELLED while leaving
+        # filled_qty/avg_fill_price at whatever the background task last
+        # wrote -- a lost-update race that produces a CANCELLED order
+        # showing a full fill. The lock serializes the two writers instead.
         .options(selectinload(Order.broker), selectinload(Order.events))
         .where(Order.id == order_id)
+        .with_for_update()
     )
     order = result.scalar_one_or_none()
     if not order:

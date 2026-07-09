@@ -143,6 +143,12 @@ class SymbolOut(BaseModel):
 
 class OrderCreate(BaseModel):
     broker_id: uuid.UUID
+    client_order_id: str | None = Field(
+        None, max_length=100,
+        description="Caller-supplied idempotency key. Retrying the same key "
+                     "for this user is rejected as a duplicate rather than "
+                     "double-submitted to the broker.",
+    )
     symbol: str
     side: str                              # BUY | SELL
     # MARKET|LIMIT|STOP|STOP_LIMIT|TWAP|VWAP|OCO|ICEBERG -- NOTE: TWAP/VWAP/OCO/
@@ -155,13 +161,15 @@ class OrderCreate(BaseModel):
     stop_price: float | None = None
     time_in_force: str = "GTC"
     strategy_id: uuid.UUID | None = None
-    algo_config: dict | None = None        # TWAP/VWAP slice parameters (not yet consumed by any adapter)
+    algo_config: dict | None = None        # slice params consumed by app.services.execution_algo:
+                                            # {"slices": int, "interval_seconds": float,
+                                            #  "display_qty": float (ICEBERG only)}
 
-# Order types with a real slicing/algorithmic execution engine wired in.
-# Empty until Track B ships real TWAP/VWAP/POV/Iceberg/Sniper execution --
-# every order type instant-fills via the broker adapter today, MARKET included.
-# Update this set as each algorithm actually ships; nothing else needs to change.
-_ALGORITHMIC_ORDER_TYPES: set[str] = set()
+# Order types with a real slicing/algorithmic execution engine wired in
+# (see app.services.execution_algo.run_algo_order). OCO has no engine yet
+# and still instant-fills like MARKET. Update this set as each algorithm
+# actually ships; nothing else needs to change.
+_ALGORITHMIC_ORDER_TYPES: set[str] = {"TWAP", "VWAP", "ICEBERG"}
 
 class OrderOut(BaseModel):
     model_config = {"from_attributes": True}
@@ -188,11 +196,12 @@ class OrderOut(BaseModel):
     @property
     def execution_style(self) -> str:
         """
-        "INSTANT" = filled immediately by the broker adapter (every order type
-        today, including TWAP/VWAP/OCO/ICEBERG -- there is no slicing engine
-        yet, so these currently behave exactly like MARKET despite the label).
-        "ALGORITHMIC" is reserved for once a real execution algorithm exists
-        for this order_type.
+        "INSTANT" = filled immediately by the broker adapter in a single call
+        (MARKET/LIMIT/STOP/STOP_LIMIT/OCO -- OCO has no algorithm yet and
+        instant-fills like MARKET despite the label).
+        "ALGORITHMIC" = executed as a background slice schedule by
+        app.services.execution_algo (TWAP/VWAP/ICEBERG) -- the order starts
+        SUBMITTED with zero fills and walks to PARTIAL/FILLED as slices land.
         """
         return "ALGORITHMIC" if self.order_type in _ALGORITHMIC_ORDER_TYPES else "INSTANT"
 

@@ -1,54 +1,69 @@
 """
-MT5BridgeAdapter
-================
-Bi-directional WebSocket stream between this Python server and the MT5 EA.
+MT5 broker bridge.
+===================
+MT5 has no public REST/WS trading API -- execution happens through an
+Expert Advisor (EA) running inside the trader's MT5 terminal, which opens a
+WebSocket connection *to us* (see app/api/v1/endpoints/mt5_bridge.py) and
+stays connected for the life of the terminal session. That's the reverse of
+every other adapter in broker_service.py, which dials out to a broker's
+REST API per call -- there's nothing to "connect to" here, only a
+connection to wait for.
 
-Field mapping — Order  →  EA wire frame:
-  order.id            →  "order_id"       (our internal UUID)
-  order.nonce         →  "nonce"          (matches asyncio.Future)
-  order.symbol        →  "symbol"
-  order.side          →  "action"         (BUY | SELL)
-  order.order_type    →  "order_type"     (MARKET | LIMIT | STOP | STOP_LIMIT)
-  order.qty           →  "volume"         (MT5 uses "volume")
-  order.price         →  "price"
-  order.stop_price    →  "stop_price"
-  algo_config.magic   →  "magic"
-  algo_config.comment →  "comment"
+Three pieces:
+  MT5Connection     -- one live EA WebSocket, keyed by broker_id. Owns the
+                       correlation-id/future bookkeeping used to match a
+                       PLACE_ORDER request to its async ORDER_RESULT reply.
+  MT5BridgeRegistry -- process-wide singleton mapping broker_id (str) to
+                       MT5Connection. The WS endpoint registers/unregisters
+                       connections here; MT5Adapter looks them up here.
+  MT5Adapter        -- duck-types broker_service.BrokerAdapter (not a
+                       subclass -- see broker_service.py for why). Built
+                       fresh per call like every other adapter, but every
+                       method delegates to the shared registry for the
+                       actual long-lived, EA-initiated connection.
 
-ExecutionResult field mapping — EA response  →  Order column:
-  "ticket"         →  broker_order_id   (str)
-  "avg_fill_price" →  avg_fill_price
-  "filled_qty"     →  filled_qty
-  "commission"     →  commission  (not an ORM column, carried in fills)
+KNOWN DEPLOYMENT CONSTRAINT: mt5_registry is an in-process singleton, not
+backed by Redis like the app's other cross-worker fan-out (see "Redis
+listener" at startup). Dockerfile runs `uvicorn --workers 2` -- an EA
+connecting via /ws/mt5/{broker_id} lands on one worker's registry, and an
+order HTTP request handled by the *other* worker will see "EA not
+connected" even though it genuinely is, just to a sibling process. This
+fails safe (a clear rejection, not a hang or corrupted order) but is not
+correct under >1 worker without either sticky routing on broker_id at the
+LB/ingress layer, or relaying PLACE_ORDER/ORDER_RESULT through Redis
+pub/sub the way the rest of the app already does. Pin MT5 traffic to a
+single worker (or a dedicated process) until that relay exists.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from typing import Any, Callable, Dict, Optional
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
-import websockets
-from websockets.exceptions import ConnectionClosed
+from fastapi import WebSocket
+from starlette.websockets import WebSocketDisconnect
 
-from app.models.all_models import ExecutionResult, Order
+from app.models.all_models import Broker, ExecutionResult, Order
+from app.schemas.all_schemas import BrokerTestResult
 
 log = logging.getLogger(__name__)
 
 
-def _order_to_ea_payload(order: Order) -> dict:
-    """Convert internal Order to the MT5 EA wire format."""
+def _order_to_ea_payload(order: Order, correlation_id: str) -> dict:
+    """Convert an Order (or execution_algo._SliceOrder) to the EA wire format."""
     algo = order.algo_config or {}
     payload: Dict[str, Any] = {
-        "type":       "PLACE_ORDER",
-        "nonce":      order.nonce,
-        "order_id":   str(order.id),
-        "symbol":     order.symbol,
-        "action":     order.side,           # "BUY" | "SELL"
-        "order_type": order.order_type,     # "MARKET" | "LIMIT" | ...
-        "volume":     order.qty,            # MT5 calls it volume
-        "magic":      algo.get("magic", 0),
-        "comment":    algo.get("comment", ""),
+        "type":           "PLACE_ORDER",
+        "correlation_id": correlation_id,
+        "order_id":       str(order.id),
+        "symbol":         order.symbol.symbol,
+        "action":         order.side,        # "BUY" | "SELL"
+        "order_type":     order.order_type,  # "MARKET" | "LIMIT" | ...
+        "volume":         order.qty,         # MT5 calls it volume
+        "magic":          algo.get("magic", 0),
+        "comment":        algo.get("comment", ""),
     }
     if order.price is not None:
         payload["price"] = order.price
@@ -57,143 +72,184 @@ def _order_to_ea_payload(order: Order) -> dict:
     return payload
 
 
-class MT5BridgeAdapter:
-    """One instance per MT5 terminal connection."""
+def _parse_result(raw: dict) -> ExecutionResult:
+    if raw.get("success"):
+        return ExecutionResult(
+            success         = True,
+            broker_order_id = str(raw["ticket"]) if raw.get("ticket") else None,
+            avg_fill_price  = raw.get("avg_fill_price") or raw.get("fill_price"),
+            filled_qty      = raw.get("filled_qty") or raw.get("fill_volume"),
+            commission      = raw.get("commission"),
+            raw             = raw,
+        )
+    return ExecutionResult(
+        success       = False,
+        error_code    = raw.get("error_code"),
+        error_message = raw.get("error_message", "Unknown error from EA"),
+        raw           = raw,
+    )
 
-    def __init__(
-        self,
-        account_id: str,
-        on_tick: Optional[Callable[[dict], None]] = None,
-        on_position_update: Optional[Callable[[dict], None]] = None,
-    ):
-        self.account_id = account_id
-        self._ws: Optional[websockets.WebSocketServerProtocol] = None
-        self._pending_futures: Dict[str, asyncio.Future] = {}
-        self._connected = asyncio.Event()
-        self._on_tick = on_tick
-        self._on_position_update = on_position_update
-        self._receive_task: Optional[asyncio.Task] = None
 
-    # ── Connection lifecycle ──────────────────────────────────────────────────
+class MT5Connection:
+    """One live EA WebSocket for a single broker_id."""
 
-    async def attach(self, ws) -> None:
+    def __init__(self, broker_id: str, ws: WebSocket):
+        self.broker_id = broker_id
         self._ws = ws
-        self._connected.set()
-        log.info("[MT5:%s] EA connected", self.account_id)
-        self._receive_task = asyncio.create_task(self._receive_loop())
-
-    async def detach(self) -> None:
-        self._connected.clear()
-        self._ws = None
-        for nonce, fut in list(self._pending_futures.items()):
-            if not fut.done():
-                fut.set_exception(ConnectionError("MT5 EA disconnected"))
-        self._pending_futures.clear()
-        log.warning("[MT5:%s] EA disconnected", self.account_id)
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._connected = True
+        self.connected_at = datetime.now(timezone.utc)
 
     @property
     def is_connected(self) -> bool:
-        return self._connected.is_set() and self._ws is not None
+        return self._connected
 
-    # ── Order execution ───────────────────────────────────────────────────────
-
-    async def execute_order(self, order: Order, timeout: float = 10.0) -> ExecutionResult:
-        if not self.is_connected:
-            await asyncio.wait_for(self._connected.wait(), timeout=timeout)
-
+    async def send_request(self, payload: dict, timeout: float = 10.0) -> dict:
+        if not self._connected:
+            raise ConnectionError(f"MT5 EA disconnected for broker {self.broker_id}")
+        correlation_id = payload["correlation_id"]
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending_futures[order.nonce] = fut
-
-        payload = _order_to_ea_payload(order)
+        self._pending[correlation_id] = fut
         try:
-            await self._ws.send(json.dumps(payload))
-            log.debug("[MT5:%s] → %s", self.account_id, payload)
-            raw_result = await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            self._pending_futures.pop(order.nonce, None)
-            return ExecutionResult(success=False, error_message="MT5 response timeout")
-        except Exception as exc:
-            self._pending_futures.pop(order.nonce, None)
-            return ExecutionResult(success=False, error_message=str(exc))
+            await self._ws.send_json(payload)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending.pop(correlation_id, None)
 
-        return self._parse_result(raw_result)
-
-    async def cancel_order(self, broker_order_id: str, nonce: str, timeout: float = 10.0) -> ExecutionResult:
-        if not self.is_connected:
-            return ExecutionResult(success=False, error_message="Not connected")
-
-        fut = asyncio.get_event_loop().create_future()
-        self._pending_futures[nonce] = fut
-
-        await self._ws.send(json.dumps({
-            "type":            "CANCEL_ORDER",
-            "nonce":           nonce,
-            "broker_order_id": broker_order_id,    # was "ticket" — now aligned
-        }))
+    async def receive_loop(self) -> None:
+        """Drains inbound EA frames until the socket closes. Run as the
+        WS endpoint's main loop -- resolves pending futures as replies land."""
         try:
-            raw = await asyncio.wait_for(fut, timeout=timeout)
-            return self._parse_result(raw)
-        except asyncio.TimeoutError:
-            self._pending_futures.pop(nonce, None)
-            return ExecutionResult(success=False, error_message="Cancel timeout")
+            while True:
+                msg = await self._ws.receive_json()
+                self._dispatch(msg)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            self._connected = False
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("MT5 EA disconnected"))
+            self._pending.clear()
 
-    # ── Inbound message loop ──────────────────────────────────────────────────
-
-    async def _receive_loop(self) -> None:
-        try:
-            async for raw in self._ws:
-                try:
-                    msg = json.loads(raw)
-                    log.debug("[MT5:%s] ← %s", self.account_id, msg)
-                    await self._dispatch(msg)
-                except json.JSONDecodeError:
-                    log.error("[MT5:%s] Bad JSON: %s", self.account_id, raw[:200])
-        except ConnectionClosed:
-            await self.detach()
-
-    async def _dispatch(self, msg: dict) -> None:
+    def _dispatch(self, msg: dict) -> None:
         msg_type = msg.get("type")
-
-        if msg_type == "ORDER_RESULT":
-            nonce = msg.get("nonce")
-            fut = self._pending_futures.pop(nonce, None)
+        if msg_type in ("ORDER_RESULT", "CANCEL_RESULT", "ACCOUNT_INFO", "POSITIONS", "PONG"):
+            correlation_id = msg.get("correlation_id")
+            fut = self._pending.get(correlation_id)
             if fut and not fut.done():
                 fut.set_result(msg)
-
-        elif msg_type == "TICK":
-            if self._on_tick:
-                self._on_tick(msg)
-
-        elif msg_type == "POSITION_UPDATE":
-            if self._on_position_update:
-                self._on_position_update(msg)
-
-        elif msg_type == "PONG":
-            pass
-
         else:
-            log.warning("[MT5:%s] Unknown type: %s", self.account_id, msg_type)
+            log.warning("[MT5:%s] Unknown message type: %s", self.broker_id, msg_type)
 
-    # ── Result parsing ────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _parse_result(raw: dict) -> ExecutionResult:
-        if raw.get("success"):
-            return ExecutionResult(
-                success        = True,
-                broker_order_id = str(raw["ticket"]) if raw.get("ticket") else None,
-                avg_fill_price  = raw.get("avg_fill_price") or raw.get("fill_price"),
-                filled_qty      = raw.get("filled_qty")     or raw.get("fill_volume"),
-                commission      = raw.get("commission"),
-                raw             = raw,
+class MT5BridgeRegistry:
+    """Process-wide singleton: broker_id (str) -> MT5Connection."""
+
+    def __init__(self):
+        self._connections: Dict[str, MT5Connection] = {}
+
+    def get(self, broker_id: str) -> Optional[MT5Connection]:
+        return self._connections.get(broker_id)
+
+    async def register(self, broker_id: str, ws: WebSocket) -> MT5Connection:
+        conn = MT5Connection(broker_id, ws)
+        self._connections[broker_id] = conn
+        log.info("[MT5:%s] EA connected", broker_id)
+        return conn
+
+    def unregister(self, broker_id: str) -> None:
+        if self._connections.pop(broker_id, None) is not None:
+            log.info("[MT5:%s] EA disconnected", broker_id)
+
+    def status(self) -> dict:
+        return {bid: conn.is_connected for bid, conn in self._connections.items()}
+
+
+mt5_registry = MT5BridgeRegistry()
+
+
+class MT5Adapter:
+    """
+    Every call here depends on an EA already being connected via
+    /ws/mt5/{broker_id} -- there's no way to "dial out" to a MetaTrader
+    terminal. Calls made while disconnected fail fast with a clear message
+    instead of hanging until an HTTP timeout.
+    """
+
+    def __init__(self, broker: Broker, credentials: dict):
+        self.broker = broker
+        self.creds = credentials
+
+    def _connection(self) -> MT5Connection:
+        conn = mt5_registry.get(str(self.broker.id))
+        if conn is None or not conn.is_connected:
+            raise ConnectionError(
+                f"MT5 EA not connected for broker {self.broker.id} -- "
+                f"pair the terminal via /ws/mt5/{self.broker.id} first."
             )
-        return ExecutionResult(
-            success       = False,
-            error_code    = raw.get("error_code"),
-            error_message = raw.get("error_message", "Unknown error from EA"),
-            raw           = raw,
-        )
+        return conn
 
-    async def ping(self) -> None:
-        if self._ws:
-            await self._ws.send(json.dumps({"type": "PING"}))
+    async def test_connection(self) -> BrokerTestResult:
+        conn = mt5_registry.get(str(self.broker.id))
+        if conn is None or not conn.is_connected:
+            return BrokerTestResult(success=False, latency_ms=None, message="MT5 EA not connected")
+        t0 = time.perf_counter()
+        try:
+            await conn.send_request({"type": "PING", "correlation_id": f"ping-{t0}"}, timeout=5.0)
+        except (asyncio.TimeoutError, ConnectionError):
+            pass  # EA may not echo a correlated PONG -- absence isn't fatal, the socket is up
+        latency = (time.perf_counter() - t0) * 1000
+        return BrokerTestResult(success=True, latency_ms=round(latency, 2), message="EA connected")
+
+    async def get_account(self) -> dict:
+        conn = self._connection()
+        corr = f"acct-{time.time()}"
+        try:
+            return await conn.send_request({"type": "GET_ACCOUNT", "correlation_id": corr})
+        except asyncio.TimeoutError:
+            return {}
+
+    async def submit_order(self, order: Order) -> dict:
+        conn = self._connection()
+        correlation_id = order.client_order_id or str(order.id)
+        payload = _order_to_ea_payload(order, correlation_id)
+        try:
+            raw = await conn.send_request(payload, timeout=10.0)
+        except asyncio.TimeoutError:
+            result = ExecutionResult(success=False, error_message="MT5 response timeout")
+        else:
+            result = _parse_result(raw)
+
+        if not result.success:
+            raise ConnectionError(result.error_message or "MT5 order rejected")
+        return {
+            "broker_order_id": result.broker_order_id,
+            "status":          "FILLED" if result.filled_qty else "SUBMITTED",
+            "avg_price":       result.avg_fill_price,
+        }
+
+    async def cancel_order(self, broker_order_id: str) -> dict:
+        conn = self._connection()
+        payload = {
+            "type":             "CANCEL_ORDER",
+            "correlation_id":   f"cancel-{broker_order_id}",
+            "broker_order_id":  broker_order_id,
+        }
+        try:
+            raw = await conn.send_request(payload, timeout=10.0)
+        except asyncio.TimeoutError:
+            return {"status": "CANCEL_TIMEOUT"}
+        result = _parse_result(raw)
+        return {"status": "CANCELLED" if result.success else "CANCEL_FAILED"}
+
+    async def get_positions(self) -> list[dict]:
+        conn = self._connection()
+        try:
+            result = await conn.send_request({"type": "GET_POSITIONS", "correlation_id": f"pos-{time.time()}"})
+        except asyncio.TimeoutError:
+            return []
+        return result.get("positions", [])
+
+    async def get_fills(self, since: datetime | None = None) -> list[dict]:
+        return []  # the EA reports fills inline on ORDER_RESULT; no separate history request yet

@@ -12,7 +12,9 @@ from app.schemas.all_schemas import (
     OrderCreate, OrderOut, FillOut, TCAReport,
     CancelOrderResponse, PaginatedResponse,
 )
-from app.services.order_service import submit_order, cancel_order, get_tca_report
+from app.schemas.all_schemas import _ALGORITHMIC_ORDER_TYPES
+from app.services.order_service import submit_order, cancel_order, get_tca_report, start_algo_execution
+from app.services.trade_events import publish_order_event, publish_position_event
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -28,11 +30,12 @@ async def create_order(
     Submit a new order. Runs risk gate before sending to broker.
     Supports: MARKET, LIMIT, STOP, STOP_LIMIT, OCO, TWAP, VWAP, ICEBERG.
 
-    NOTE: OCO/TWAP/VWAP/ICEBERG have no slicing/algorithmic execution engine
-    yet -- they currently execute as market-order-equivalent (instant, full-
-    quantity fill), same as MARKET. Check the response's `execution_style`
-    field ("INSTANT" vs "ALGORITHMIC") rather than assuming the order_type
-    implies real algorithmic execution.
+    TWAP/VWAP/ICEBERG execute algorithmically via a background slice
+    schedule (app/services/execution_algo.py) -- the response comes back
+    SUBMITTED with zero fills and fills accumulate over the schedule.
+    Everything else (incl. OCO/STOP_LIMIT) executes as a single broker
+    call. Check the response's `execution_style` field ("INSTANT" vs
+    "ALGORITHMIC") to know which path an order took.
     """
     ip = request.client.host if request.client else None
     order = await submit_order(
@@ -43,6 +46,16 @@ async def create_order(
         ip=ip,
     )
     await db.commit()
+    if data.order_type in _ALGORITHMIC_ORDER_TYPES and order.status == "SUBMITTED":
+        start_algo_execution(order.id)
+    # Post-commit WS nudges (user-scoped; see trade_events.py). Instant fills
+    # changed positions too; algo orders publish per slice from execution_algo.
+    await publish_order_event(
+        current_user.id, order_id=order.id, status=order.status,
+        symbol_name=data.symbol, filled_qty=float(order.filled_qty or 0),
+    )
+    if order.status == "FILLED":
+        await publish_position_event(current_user.id, symbol_name=data.symbol)
     return await _load_order(db, order.id)
 
 
@@ -108,6 +121,7 @@ async def cancel(
         user_email=current_user.email,
     )
     await db.commit()
+    await publish_order_event(current_user.id, order_id=order.id, status=order.status)
     return CancelOrderResponse(order_id=order.id, status=order.status, message="Order cancelled")
 
 

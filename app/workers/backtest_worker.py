@@ -597,13 +597,16 @@ def _mutate_config(config):
 
 
 # ─── Beat schedule ────────────────────────────────────────────────────────────
+# Merge into the schedule celery_app.py already owns (which includes
+# snapshot-pnl-5min) rather than overwriting it — a prior version of this
+# module replaced celery_app.conf.beat_schedule wholesale, which silently
+# dropped celery_app.py's entries depending on import order.
 from celery.schedules import crontab
 
-celery_app.conf.beat_schedule = {
-    "snapshot-pnl-5min":     {"task": "snapshot_pnl",           "schedule": 300.0},
+celery_app.conf.beat_schedule.update({
     "regime-scan-hourly":    {"task": "regime_scan",             "schedule": crontab(minute=0)},
     "darwin-nightly":        {"task": "darwin_evolution_cycle",  "schedule": crontab(hour=2, minute=0)},
     "drift-monitor-daily":   {"task": "drift_monitor",           "schedule": crontab(hour=6, minute=0)},
     "alpha-factory-nightly": {"task": "alpha_factory_search",    "schedule": crontab(hour=3, minute=0)},
-}
+})
 celery_app.conf.timezone = "UTC"

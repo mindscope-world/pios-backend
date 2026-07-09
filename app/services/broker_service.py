@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decrypt_credentials, encrypt_credentials
 from app.models.all_models import Broker, Order
 from app.schemas.all_schemas import BrokerCreate, BrokerTestResult
+from app.services.brokers.mt5.adapter import MT5Adapter
 
 
 # ── Abstract Adapter ──────────────────────────────────────────────────────────
@@ -208,10 +209,15 @@ class PaperAdapter(BrokerAdapter):
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
+# MT5Adapter duck-types BrokerAdapter rather than subclassing it -- it lives in
+# app.services.brokers.mt5.adapter, which the MT5 EA WebSocket endpoint also
+# needs to import (for the connection registry); subclassing here would create
+# a broker_service <-> mt5.adapter import cycle.
 ADAPTER_MAP = {
     "ALPACA": AlpacaAdapter,
     "BINANCE": CCXTAdapter,
     "CCXT": CCXTAdapter,
+    "MT5": MT5Adapter,
     "PAPER": PaperAdapter,
 }
 

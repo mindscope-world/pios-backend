@@ -90,7 +90,15 @@ async def process_symbol(symbol: str):
         # Adjust get_system_user() to return whatever user drives the engine.
         system_user = await get_system_user(db)
         if not system_user:
-            print("⚠️  No system user configured, skipping process_symbol.")
+            from app.core.config import settings
+            print(
+                f"❌  System user {settings.SYSTEM_USER_EMAIL!r} not found in the users "
+                f"table — the intelligence worker cannot compute anything without it, and "
+                f"the frontend order ticket will sit on 'waiting for the intelligence "
+                f"worker' forever. Fix: register that account (POST /auth/register or the "
+                f"users admin screen), or point SYSTEM_USER_EMAIL in .env at an existing "
+                f"user. See docs/RUNNING.md."
+            )
             return
 
         try:

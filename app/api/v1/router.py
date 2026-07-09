@@ -5,6 +5,7 @@ from app.api.v1.endpoints import (
     positions, strategies, risk,
     alerts, audit, data_quality,
     intelligence, behavior, capital, websocket,
+    mt5_bridge,
 )
 from app.api.v1.endpoints.execution_quality import (
     data_router,
@@ -35,5 +36,6 @@ api_router.include_router(data_router)           # /data/integrity/*
 api_router.include_router(tca_router)            # /execution/tca/*
 api_router.include_router(market_ticks_router)   # /market/ticks/{symbol_id}
 
-# ── WebSocket endpoint ───────────────────────────────────────────────────────
+# ── WebSocket endpoints ──────────────────────────────────────────────────────
 api_router.include_router(websocket.router)     # /ws
+api_router.include_router(mt5_bridge.router)    # /ws/mt5/{broker_id} -- MT5 EA bridge
