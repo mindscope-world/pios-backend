@@ -3,25 +3,26 @@ from datetime import datetime, timedelta, timezone
 from redis import asyncio
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.helpers.helpers import latest_regime, open_positions, get_primary_with_ticks, safe_float, now_iso, get_symbol_by_name, safe_ms
+from app.helpers.helpers import latest_regime, open_positions, get_primary_with_ticks, get_symbol_with_ticks, safe_float, now_iso, get_symbol_by_name, safe_ms
 from app.models.all_models import KillSwitchEvent, MarketTick, Strategy, Symbol, User
 from app.services.market_data_service import get_live_ticker, get_orderbook
 from app.services.quant_engine import compute_ofi_signals, detect_outlier_ticks
 
 
-async def compute_why_not_trade(current_user, db):
+async def compute_why_not_trade(current_user, db, symbol: str | None = None):
     """
-    Why-Not-Trade constraint engine for the primary symbol.
- 
+    Why-Not-Trade constraint engine for one symbol (explicit `symbol`, or
+    the primary symbol when None — the worker passes each symbol it caches
+    under, so per-symbol keys hold that symbol's own constraints).
+
     Evaluates 7 constraint layers + live spread/liquidity overlay.
-    Symbol selection and limit filtering happen at the Redis/worker level.
- 
+
     Returns a single symbol result dict; never raises.
     """
     try:
         positions = await open_positions(db, current_user.id)
- 
-        sym, ticks = await get_primary_with_ticks(db, 100)
+
+        sym, ticks = await get_symbol_with_ticks(db, symbol, 100)
         if sym is None:
             return {
                 "error": "no_primary_symbol",

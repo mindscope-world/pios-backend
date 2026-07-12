@@ -11,7 +11,13 @@ compute …" forever with no error anywhere.
 
 ```bash
 # Terminal 1 — API server
-uvicorn main:app --reload --port 9000
+# --timeout-graceful-shutdown matters: the frontend holds SSE/WS streams
+# open indefinitely, and uvicorn's default graceful shutdown waits for ALL
+# open connections forever. Without the flag, every --reload cycle wedges
+# while a browser tab is open — the old worker never exits, the reloader
+# blocks in wait(), and all requests time out until the stuck child is
+# SIGKILLed by hand.
+uvicorn main:app --reload --port 9000 --timeout-graceful-shutdown 5
 
 # Terminal 2 — intelligence worker (REQUIRED for command-center data,
 # the order ticket, and every worker-cached /intelligence/* endpoint)
@@ -50,6 +56,8 @@ line each cycle (it used to no-op silently) and computes nothing.
 | `/intelligence/*` endpoints return `{"error": "not_yet_computed"}` forever | Same as above |
 | Worker logs `❌ System user … not found` | Register the account or fix `SYSTEM_USER_EMAIL` |
 | Live prices absent but command-center tiles fine | SSE stream is served by the API process — check exchange connectivity, not the worker |
+| Every API request times out after editing a backend file | `--reload` wedged on open SSE/WS connections — run uvicorn with `--timeout-graceful-shutdown 5` (see above), or `kill -9` the app child (the process whose parent is the `uvicorn` you started) |
+| Ticket/tabs flicker between data and "waiting" every few seconds | Fixed 2026-07-09: worker snapshots used a 5s Redis TTL while a full cycle takes far longer — now `SNAPSHOT_TTL_S = 300` in `intelligence_worker.py` |
 
 ## 4. Realtime channels (for reference)
 

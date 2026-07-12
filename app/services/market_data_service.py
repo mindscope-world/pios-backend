@@ -6,9 +6,13 @@ Real-time market data from globally-available exchanges (no Binance):
   - OKX       — crypto, global
   - Kraken    — crypto, EU/US/global
   - Bybit     — crypto, global
-  - Alpaca    — US stocks + forex
-  - OANDA     — forex (60+ pairs)
-  - yfinance  — stocks, ETFs, indices (fallback REST)
+  - Alpaca    — US stocks (primary) + crypto (fallback venue)
+  - OANDA     — forex + metals (60+ pairs)
+  - yfinance  — indices; stocks/ETFs fallback when Alpaca unavailable
+
+Domain routing: forex/metals pairs → OANDA · plain US tickers → Alpaca
+(yfinance fallback) · crypto pairs → ccxt venues, Alpaca last-resort ·
+^indices → yfinance.
 
 Provides:
   • get_live_ticker(symbol, exchanges)  — best-bid/ask + price across venues
@@ -202,12 +206,45 @@ def _oanda_headers() -> dict[str, str]:
     }
 
 
+# OANDA serves fiat pairs and metals-vs-fiat; everything else (any side being
+# a crypto asset — BTC/USDT, ETH/USDC, …) must go to the ccxt exchanges. The
+# old "any X/Y is forex" version of this routed ALL crypto pairs to OANDA,
+# which (without credentials) made every ticker/orderbook/trades/OHLCV call
+# for crypto return oanda_credentials_missing — no live price anywhere.
+_FIAT_CCYS = {"USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "SGD", "HKD", "SEK", "NOK", "DKK", "PLN", "ZAR", "MXN", "TRY", "CNH"}
+_METALS = {"XAU", "XAG", "XPT", "XPD"}
+
+
+def _split_pair(symbol: str) -> tuple[str, str] | None:
+    """
+    (base, quote) for both symbol conventions in play: the frontend's
+    slashed form ("EUR/USD", "XAU/USD") and the DB's slash-less form
+    ("EURUSD", "XAUUSD" — see the symbols table). Returns None for
+    anything that doesn't look like a two-sided pair.
+    """
+    if not isinstance(symbol, str):
+        return None
+    s = symbol.strip().upper()
+    if "/" in s:
+        parts = s.split("/")
+        return (parts[0], parts[1]) if len(parts) == 2 and all(parts) else None
+    if len(s) in (6, 7) and s[-3:] in _FIAT_CCYS:
+        return s[:-3], s[-3:]
+    return None
+
+
 def _is_forex_symbol(symbol: str) -> bool:
-    return isinstance(symbol, str) and "/" in symbol and len(symbol.split("/")) == 2
+    pair = _split_pair(symbol)
+    if pair is None:
+        return False
+    base, quote = pair
+    return quote in _FIAT_CCYS and (base in _FIAT_CCYS or base in _METALS)
 
 
 def _oanda_instrument(symbol: str) -> str:
-    return symbol.replace("/", "_")
+    # OANDA wants EUR_USD — handle both "EUR/USD" and the DB's "EURUSD".
+    pair = _split_pair(symbol)
+    return f"{pair[0]}_{pair[1]}" if pair else symbol.replace("/", "_")
 
 
 async def _fetch_oanda_pricing(symbol: str) -> dict:
@@ -256,6 +293,268 @@ async def _fetch_oanda_transactions(symbol: str, limit: int = 50) -> list[dict]:
             "exchange": "oanda",
         })
     return trades
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alpaca market data — US equities (primary) + crypto (last-resort venue)
+# ─────────────────────────────────────────────────────────────────────────────
+# Domain routing mirrors OANDA's: forex/metals → OANDA, plain US tickers →
+# Alpaca (yfinance demoted to fallback), crypto pairs → ccxt venues with
+# Alpaca's crypto feed as the fallback when every ccxt venue fails. Talks to
+# the data REST API directly (no SDK), like app/providers/stocks.py; paper
+# keys get the free IEX feed (SIP 403s without a paid data subscription).
+
+_ALPACA_DATA_BASE   = "https://data.alpaca.markets"
+_ALPACA_CRYPTO_BASE = f"{_ALPACA_DATA_BASE}/v1beta3/crypto/us"
+
+_ALPACA_TIMEFRAMES     = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour", "4h": "4Hour", "1d": "1Day"}
+_ALPACA_TIMEFRAME_MINS = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+
+
+def _has_alpaca_credentials() -> bool:
+    return bool(settings.ALPACA_API_KEY and settings.ALPACA_API_SECRET)
+
+
+def _alpaca_headers() -> dict[str, str]:
+    return {
+        "APCA-API-KEY-ID":     settings.ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": settings.ALPACA_API_SECRET,
+        "Accept":              "application/json",
+    }
+
+
+def _is_equity_symbol(symbol: str) -> bool:
+    """
+    Plain US tickers (AAPL, SPY, BRK.B). Excludes pairs (anything with a
+    slash), the slash-less forex/metal forms (EURUSD, XAUUSD) and index
+    symbols (^GSPC — those stay on yfinance; Alpaca has no indices).
+    """
+    if not isinstance(symbol, str):
+        return False
+    s = symbol.strip().upper()
+    if not s or "/" in s or s.startswith("^") or _is_forex_symbol(s):
+        return False
+    return len(s) <= 6 and s.replace(".", "").replace("-", "").isalpha()
+
+
+def _alpaca_crypto_candidates(symbol: str) -> list[str]:
+    """Alpaca quotes crypto against USD; the app's convention is mostly
+    /USDT. Try the symbol as-is first, then the /USD equivalent."""
+    s = symbol.strip().upper()
+    if "/" not in s:
+        return []
+    cands = [s]
+    for alt in ("USDT", "USDC"):
+        if s.endswith("/" + alt):
+            cands.append(s[: -len(alt)] + "USD")
+    return cands
+
+
+async def _alpaca_get(url: str, params: dict | None = None) -> dict:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=_alpaca_headers(), params=params or {}, timeout=15) as response:
+            response.raise_for_status()
+            return await response.json()
+
+
+def _alpaca_bar_params(timeframe: str, limit: int) -> dict:
+    # Explicit start: without it Alpaca defaults to "today", which is empty
+    # on weekends/holidays for stocks. 3× the nominal window (min 4 days)
+    # covers closed market hours; sort=desc keeps the most recent `limit`.
+    mins = _ALPACA_TIMEFRAME_MINS.get(timeframe, 60)
+    lookback = max(timedelta(minutes=mins * limit * 3), timedelta(days=4))
+    return {
+        "timeframe": _ALPACA_TIMEFRAMES.get(timeframe, "1Hour"),
+        "limit": limit,
+        "start": (datetime.now(timezone.utc) - lookback).isoformat(),
+        "sort": "desc",
+    }
+
+
+def _alpaca_bar_to_candle(b: dict) -> dict:
+    ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00"))
+    return {
+        "ts":     int(ts.timestamp() * 1000),
+        "time":   b["t"],
+        "open":   float(b["o"]),
+        "high":   float(b["h"]),
+        "low":    float(b["l"]),
+        "close":  float(b["c"]),
+        "volume": float(b.get("v", 0)),
+    }
+
+
+def _alpaca_snapshot_to_ticker(symbol: str, snap: dict) -> dict | None:
+    """Stock and crypto snapshots share this shape (latestTrade/latestQuote/
+    dailyBar/prevDailyBar) → the get_live_ticker payload."""
+    quote = snap.get("latestQuote") or {}
+    trade = snap.get("latestTrade") or {}
+    day   = snap.get("dailyBar") or {}
+    prev  = snap.get("prevDailyBar") or {}
+    last = trade.get("p") or day.get("c")
+    bid = float(quote.get("bp") or 0) or None
+    ask = float(quote.get("ap") or 0) or None
+    # On thin pairs (Alpaca's crypto USDT books) latestTrade can be hours
+    # stale while the quote is live — trust the mid when they disagree.
+    mid = (bid + ask) / 2 if bid and ask else None
+    if mid and (not last or abs(float(last) - mid) / mid > 0.01):
+        last = mid
+    if not last:
+        return None
+    last = round(float(last), 8)
+    spread_pct = round((ask - bid) / bid * 100, 4) if bid and ask else None
+    prev_close = prev.get("c")
+    change_pct = (
+        round((last - float(prev_close)) / float(prev_close) * 100, 4)
+        if prev_close else None
+    )
+    return {
+        "symbol":         symbol,
+        "last":           last,
+        "bid":            bid,
+        "ask":            ask,
+        "spread_pct":     spread_pct,
+        "vwap":           day.get("vw"),
+        "open_24h":       day.get("o"),
+        "high_24h":       day.get("h"),
+        "low_24h":        day.get("l"),
+        "volume_24h":     day.get("v"),
+        "change_pct_24h": change_pct,
+        "sources":        ["alpaca"],
+        "fetched_at":     trade.get("t") or datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _alpaca_stock_ticker(symbol: str) -> dict | None:
+    snap = await _alpaca_get(
+        f"{_ALPACA_DATA_BASE}/v2/stocks/{symbol.upper()}/snapshot",
+        {"feed": settings.ALPACA_DATA_FEED},
+    )
+    return _alpaca_snapshot_to_ticker(symbol, snap)
+
+
+async def _alpaca_crypto_ticker(symbol: str) -> dict | None:
+    for cand in _alpaca_crypto_candidates(symbol):
+        try:
+            data = await _alpaca_get(f"{_ALPACA_CRYPTO_BASE}/snapshots", {"symbols": cand})
+            snap = (data.get("snapshots") or {}).get(cand)
+            if snap:
+                ticker = _alpaca_snapshot_to_ticker(symbol, snap)
+                if ticker:
+                    return ticker
+        except Exception as e:
+            log.debug(f"Alpaca crypto snapshot {cand}: {e}")
+    return None
+
+
+async def _alpaca_stock_ohlcv(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    params = _alpaca_bar_params(timeframe, limit)
+    params |= {"feed": settings.ALPACA_DATA_FEED, "adjustment": "raw"}
+    data = await _alpaca_get(f"{_ALPACA_DATA_BASE}/v2/stocks/{symbol.upper()}/bars", params)
+    bars = data.get("bars") or []
+    return [_alpaca_bar_to_candle(b) for b in reversed(bars)]
+
+
+async def _alpaca_crypto_ohlcv(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    for cand in _alpaca_crypto_candidates(symbol):
+        try:
+            params = _alpaca_bar_params(timeframe, limit) | {"symbols": cand}
+            data = await _alpaca_get(f"{_ALPACA_CRYPTO_BASE}/bars", params)
+            bars = (data.get("bars") or {}).get(cand) or []
+            if bars:
+                return [_alpaca_bar_to_candle(b) for b in reversed(bars)]
+        except Exception as e:
+            log.debug(f"Alpaca crypto bars {cand}: {e}")
+    return []
+
+
+async def _alpaca_stock_orderbook(symbol: str) -> dict | None:
+    """Alpaca has no L2 book for stocks — synthesize a one-level book from
+    the NBBO quote, same trick as the OANDA forex branch."""
+    data = await _alpaca_get(
+        f"{_ALPACA_DATA_BASE}/v2/stocks/{symbol.upper()}/quotes/latest",
+        {"feed": settings.ALPACA_DATA_FEED},
+    )
+    q = data.get("quote") or {}
+    bid = float(q.get("bp") or 0)
+    ask = float(q.get("ap") or 0)
+    if bid <= 0 or ask <= 0:
+        return None
+    # Quote sizes are in round lots (100 shares)
+    bid_qty = float(q.get("bs") or 0) * 100
+    ask_qty = float(q.get("as") or 0) * 100
+    payload = _orderbook_payload(symbol, "alpaca", [(bid, bid_qty)], [(ask, ask_qty)])
+    if payload:
+        payload["fetched_at"] = q.get("t") or payload["fetched_at"]
+    return payload
+
+
+async def _alpaca_crypto_orderbook(symbol: str, depth: int = 20) -> dict | None:
+    for cand in _alpaca_crypto_candidates(symbol):
+        try:
+            data = await _alpaca_get(f"{_ALPACA_CRYPTO_BASE}/latest/orderbooks", {"symbols": cand})
+            ob = (data.get("orderbooks") or {}).get(cand)
+            if not ob:
+                continue
+            bids = [(float(l["p"]), float(l["s"])) for l in (ob.get("b") or [])[:depth]]
+            asks = [(float(l["p"]), float(l["s"])) for l in (ob.get("a") or [])[:depth]]
+            payload = _orderbook_payload(symbol, "alpaca", bids, asks)
+            if payload:
+                payload["fetched_at"] = ob.get("t") or payload["fetched_at"]
+                return payload
+        except Exception as e:
+            log.debug(f"Alpaca crypto orderbook {cand}: {e}")
+    return None
+
+
+async def _alpaca_stock_trades(symbol: str, limit: int = 50) -> list[dict]:
+    params = {
+        "limit": limit,
+        "feed": settings.ALPACA_DATA_FEED,
+        "sort": "desc",
+        # Same weekend problem as bars: default start is "today"
+        "start": (datetime.now(timezone.utc) - timedelta(days=4)).isoformat(),
+    }
+    data = await _alpaca_get(f"{_ALPACA_DATA_BASE}/v2/stocks/{symbol.upper()}/trades", params)
+    return [
+        {
+            "id":       str(t.get("i", "")),
+            "time":     t.get("t") or datetime.now(timezone.utc).isoformat(),
+            "price":    float(t["p"]),
+            "amount":   float(t.get("s") or 0),
+            # Stock trade condition codes don't encode the aggressor side
+            "side":     "NEUTRAL",
+            "cost":     float(t["p"]) * float(t.get("s") or 0),
+            "exchange": "alpaca",
+        }
+        for t in data.get("trades") or [] if t.get("p")
+    ]
+
+
+async def _alpaca_crypto_trades(symbol: str, limit: int = 50) -> list[dict]:
+    for cand in _alpaca_crypto_candidates(symbol):
+        try:
+            data = await _alpaca_get(
+                f"{_ALPACA_CRYPTO_BASE}/trades",
+                {"symbols": cand, "limit": limit, "sort": "desc"},
+            )
+            trades = (data.get("trades") or {}).get(cand) or []
+            if trades:
+                return [
+                    {
+                        "id":       str(t.get("i", "")),
+                        "time":     t.get("t") or datetime.now(timezone.utc).isoformat(),
+                        "price":    float(t["p"]),
+                        "amount":   float(t.get("s") or 0),
+                        "side":     {"B": "BUY", "S": "SELL"}.get(t.get("tks"), "NEUTRAL"),
+                        "cost":     float(t["p"]) * float(t.get("s") or 0),
+                        "exchange": "alpaca",
+                    }
+                    for t in trades if t.get("p")
+                ]
+        except Exception as e:
+            log.debug(f"Alpaca crypto trades {cand}: {e}")
+    return []
 
 
 async def close_all_exchanges():
@@ -319,8 +618,18 @@ async def get_live_ticker(
                 return {"symbol": symbol, "error": "oanda_unavailable", "fetched_at": datetime.now(timezone.utc).isoformat()}
         return {"symbol": symbol, "error": "oanda_credentials_missing", "fetched_at": datetime.now(timezone.utc).isoformat()}
 
+    if _is_equity_symbol(symbol):
+        if _has_alpaca_credentials():
+            try:
+                ticker = await _alpaca_stock_ticker(symbol)
+                if ticker:
+                    return ticker
+            except Exception as e:
+                log.debug(f"Alpaca ticker {symbol}: {e}")
+        return await _yf_equity_ticker(symbol)
+
     if not CCXT_AVAILABLE:
-        return _ticker_fallback(symbol)
+        return await _crypto_ticker_fallback(symbol)
 
     target_exchanges = exchanges or [DEFAULT_CRYPTO_EXCHANGE, "kraken", "okx"]
 
@@ -354,7 +663,7 @@ async def get_live_ticker(
     valid = [r for r in results if r and r.get("last")]
 
     if not valid:
-        return _ticker_fallback(symbol)
+        return await _crypto_ticker_fallback(symbol)
 
     # Best bid/ask across venues
     best_bid = max((r["bid"] for r in valid if r.get("bid")), default=None)
@@ -387,6 +696,48 @@ async def get_live_ticker(
 def _ticker_fallback(symbol: str) -> dict:
     return {"symbol": symbol, "error": "market_data_unavailable",
             "fetched_at": datetime.now(timezone.utc).isoformat()}
+
+
+async def _crypto_ticker_fallback(symbol: str) -> dict:
+    """Every ccxt venue failed (or ccxt missing) — try Alpaca's crypto feed
+    before giving up."""
+    if _has_alpaca_credentials():
+        ticker = await _alpaca_crypto_ticker(symbol)
+        if ticker:
+            return ticker
+    return _ticker_fallback(symbol)
+
+
+async def _yf_equity_ticker(symbol: str) -> dict:
+    """Equity ticker from yfinance daily bars — the fallback when Alpaca is
+    unconfigured or erroring. No intraday quote, so bid/ask stay None."""
+    df = await _yf_download(symbol, period="2d", interval="1d", progress=False, auto_adjust=True)
+    if df is not None and not df.empty:
+        try:
+            last = float(df["Close"].iloc[-1])
+            prev = float(df["Close"].iloc[-2]) if len(df) > 1 else None
+            change_pct = round((last - prev) / prev * 100, 4) if prev else None
+            return {
+                "symbol":         symbol,
+                "last":           round(last, 4),
+                "bid":            None,
+                "ask":            None,
+                "spread_pct":     None,
+                "vwap":           None,
+                "open_24h":       float(df["Open"].iloc[-1]),
+                "high_24h":       float(df["High"].iloc[-1]),
+                "low_24h":        float(df["Low"].iloc[-1]),
+                "volume_24h":     float(df["Volume"].iloc[-1]),
+                "change_pct_24h": change_pct,
+                "sources":        ["yfinance"],
+                "fetched_at":     datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception as e:
+            log.debug(f"yfinance equity ticker {symbol}: {e}")
+    if not _has_alpaca_credentials():
+        return {"symbol": symbol, "error": "alpaca_credentials_missing",
+                "fetched_at": datetime.now(timezone.utc).isoformat()}
+    return _ticker_fallback(symbol)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -445,9 +796,18 @@ async def get_ohlcv(
                 return []
         return []
 
-    ex_id = exchange_id or DEFAULT_CRYPTO_EXCHANGE
-
-    if CCXT_AVAILABLE:
+    if _is_equity_symbol(symbol):
+        if _has_alpaca_credentials():
+            try:
+                candles = await _alpaca_stock_ohlcv(symbol, timeframe, limit)
+                if candles:
+                    return candles
+            except Exception as e:
+                log.debug(f"Alpaca OHLCV {symbol}: {e}")
+        # fall through to the yfinance fallback below (skip the ccxt loop —
+        # no crypto venue lists plain US tickers)
+    elif CCXT_AVAILABLE:
+        ex_id = exchange_id or DEFAULT_CRYPTO_EXCHANGE
         for ex_name in [ex_id, "kraken", "okx", "bybit"]:
             try:
                 ex = _get_exchange(ex_name)
@@ -472,6 +832,12 @@ async def get_ohlcv(
                     ]
             except Exception as e:
                 log.debug(f"OHLCV {ex_name}: {e}")
+
+    # Alpaca crypto — last-resort venue when every ccxt exchange failed
+    if "/" in symbol and _has_alpaca_credentials():
+        candles = await _alpaca_crypto_ohlcv(symbol, timeframe, limit)
+        if candles:
+            return candles
 
     # yfinance fallback for stocks / ETFs
     if _yf_ready() and not symbol.endswith("/USDT"):
@@ -499,6 +865,75 @@ async def get_ohlcv(
 # ─────────────────────────────────────────────────────────────────────────────
 # § 3  ORDER BOOK — L2 depth
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _orderbook_payload(
+    symbol: str,
+    exchange: str,
+    bids: list[tuple[float, float]],
+    asks: list[tuple[float, float]],
+) -> dict | None:
+    """Depth metrics from normalized (price, qty) levels — shared by the
+    ccxt venues and the Alpaca books (which may be a single NBBO level)."""
+    if not bids or not asks:
+        return None
+
+    best_bid  = float(bids[0][0])
+    best_ask  = float(asks[0][0])
+    mid_price = (best_bid + best_ask) / 2
+    spread    = best_ask - best_bid
+    spread_bps= spread / mid_price * 10_000
+
+    # Volume-weighted mid
+    bid_vols  = sum(float(b[1]) for b in bids[:5])
+    ask_vols  = sum(float(a[1]) for a in asks[:5])
+    wm_mid    = (best_bid * ask_vols + best_ask * bid_vols) / (bid_vols + ask_vols + 1e-9)
+
+    # Bid-ask imbalance
+    total_bid_depth = sum(float(b[0]) * float(b[1]) for b in bids[:10])
+    total_ask_depth = sum(float(a[0]) * float(a[1]) for a in asks[:10])
+    total_depth     = total_bid_depth + total_ask_depth
+    imbalance       = (total_bid_depth - total_ask_depth) / (total_depth + 1e-9)
+
+    # Slippage estimate for $50k notional
+    def _slippage(side_levels, notional=50_000):
+        filled = 0.0
+        cost   = 0.0
+        for price, qty in side_levels:
+            value  = float(price) * float(qty)
+            take   = min(value, notional - cost)
+            filled += take / float(price)
+            cost   += take
+            if cost >= notional:
+                break
+        if filled == 0:
+            return 0.0
+        avg_fill = cost / filled
+        ref_price = float(side_levels[0][0]) if side_levels else avg_fill
+        return abs(avg_fill - ref_price) / ref_price * 100 if ref_price else 0.0
+
+    slip_buy  = _slippage(asks)
+    slip_sell = _slippage([(b[0], b[1]) for b in bids])
+
+    return {
+        "symbol":          symbol,
+        "exchange":        exchange,
+        "best_bid":        best_bid,
+        "best_ask":        best_ask,
+        "mid_price":       round(mid_price, 8),
+        "weighted_mid":    round(wm_mid, 8),
+        "spread":          round(spread, 8),
+        "spread_bps":      round(spread_bps, 4),
+        "imbalance":       round(imbalance, 4),
+        "bid_depth_usd":   round(total_bid_depth, 2),
+        "ask_depth_usd":   round(total_ask_depth, 2),
+        "slippage_buy_pct": round(slip_buy, 6),
+        "slippage_sell_pct":round(slip_sell, 6),
+        "liquidity_score": round(min(100, total_depth / 1_000_000 * 100), 1),
+        "bids": [[float(b[0]), float(b[1])] for b in bids[:15]],
+        "asks": [[float(a[0]), float(a[1])] for a in asks[:15]],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 async def get_orderbook(
     symbol: str,
@@ -560,6 +995,17 @@ async def get_orderbook(
                 return {"symbol": symbol, "error": "oanda_unavailable"}
         return {"symbol": symbol, "error": "oanda_credentials_missing"}
 
+    if _is_equity_symbol(symbol):
+        if _has_alpaca_credentials():
+            try:
+                payload = await _alpaca_stock_orderbook(symbol)
+                if payload:
+                    return payload
+            except Exception as e:
+                log.debug(f"Alpaca orderbook {symbol}: {e}")
+            return {"symbol": symbol, "error": "orderbook_unavailable"}
+        return {"symbol": symbol, "error": "alpaca_credentials_missing"}
+
     ex_id = exchange_id or DEFAULT_CRYPTO_EXCHANGE
 
     for ex_name in [ex_id, "kraken", "okx"]:
@@ -570,70 +1016,22 @@ async def get_orderbook(
             if not ex:
                 continue
             ob = await asyncio.wait_for(ex.fetch_order_book(symbol, limit=depth), timeout=5.0)
-            bids = ob.get("bids", [])[:depth]
-            asks = ob.get("asks", [])[:depth]
+            # Some venues (kraken, okx) return [price, qty, timestamp] levels —
+            # normalize to (price, qty) or the tuple unpacking below blows up.
+            bids = [(float(b[0]), float(b[1])) for b in ob.get("bids", [])[:depth]]
+            asks = [(float(a[0]), float(a[1])) for a in ob.get("asks", [])[:depth]]
 
-            if not bids or not asks:
-                continue
-
-            best_bid  = float(bids[0][0])
-            best_ask  = float(asks[0][0])
-            mid_price = (best_bid + best_ask) / 2
-            spread    = best_ask - best_bid
-            spread_bps= spread / mid_price * 10_000
-
-            # Volume-weighted mid
-            bid_vols  = sum(float(b[1]) for b in bids[:5])
-            ask_vols  = sum(float(a[1]) for a in asks[:5])
-            wm_mid    = (best_bid * ask_vols + best_ask * bid_vols) / (bid_vols + ask_vols + 1e-9)
-
-            # Bid-ask imbalance
-            total_bid_depth = sum(float(b[0]) * float(b[1]) for b in bids[:10])
-            total_ask_depth = sum(float(a[0]) * float(a[1]) for a in asks[:10])
-            total_depth     = total_bid_depth + total_ask_depth
-            imbalance       = (total_bid_depth - total_ask_depth) / (total_depth + 1e-9)
-
-            # Slippage estimate for 1 BTC / $50k notional
-            def _slippage(side_levels, notional=50_000):
-                filled = 0.0
-                cost   = 0.0
-                for price, qty in side_levels:
-                    value  = float(price) * float(qty)
-                    take   = min(value, notional - cost)
-                    filled += take / float(price)
-                    cost   += take
-                    if cost >= notional:
-                        break
-                if filled == 0:
-                    return 0.0
-                avg_fill = cost / filled
-                ref_price = float(side_levels[0][0]) if side_levels else avg_fill
-                return abs(avg_fill - ref_price) / ref_price * 100 if ref_price else 0.0
-
-            slip_buy  = _slippage(asks)
-            slip_sell = _slippage([(b[0], b[1]) for b in bids])
-
-            return {
-                "symbol":          symbol,
-                "exchange":        ex_name,
-                "best_bid":        best_bid,
-                "best_ask":        best_ask,
-                "mid_price":       round(mid_price, 8),
-                "weighted_mid":    round(wm_mid, 8),
-                "spread":          round(spread, 8),
-                "spread_bps":      round(spread_bps, 4),
-                "imbalance":       round(imbalance, 4),
-                "bid_depth_usd":   round(total_bid_depth, 2),
-                "ask_depth_usd":   round(total_ask_depth, 2),
-                "slippage_buy_pct": round(slip_buy, 6),
-                "slippage_sell_pct":round(slip_sell, 6),
-                "liquidity_score": round(min(100, total_depth / 1_000_000 * 100), 1),
-                "bids": [[float(b[0]), float(b[1])] for b in bids[:15]],
-                "asks": [[float(a[0]), float(a[1])] for a in asks[:15]],
-                "fetched_at": datetime.now(timezone.utc).isoformat(),
-            }
+            payload = _orderbook_payload(symbol, ex_name, bids, asks)
+            if payload:
+                return payload
         except Exception as e:
             log.debug(f"Orderbook {ex_name}: {e}")
+
+    # Alpaca crypto — last-resort venue when every ccxt exchange failed
+    if "/" in symbol and _has_alpaca_credentials():
+        payload = await _alpaca_crypto_orderbook(symbol, depth)
+        if payload:
+            return payload
 
     return {"symbol": symbol, "error": "orderbook_unavailable"}
 
@@ -655,6 +1053,14 @@ async def get_recent_trades(
             except Exception as e:
                 log.debug(f"OANDA trades {symbol}: {e}")
                 return []
+        return []
+
+    if _is_equity_symbol(symbol):
+        if _has_alpaca_credentials():
+            try:
+                return await _alpaca_stock_trades(symbol, limit)
+            except Exception as e:
+                log.debug(f"Alpaca trades {symbol}: {e}")
         return []
 
     ex_id = exchange_id or DEFAULT_CRYPTO_EXCHANGE
@@ -685,6 +1091,10 @@ async def get_recent_trades(
             ]
         except Exception as e:
             log.debug(f"Trades {ex_name}: {e}")
+
+    # Alpaca crypto — last-resort venue when every ccxt exchange failed
+    if "/" in symbol and _has_alpaca_credentials():
+        return await _alpaca_crypto_trades(symbol, limit)
 
     return []
 
@@ -921,6 +1331,19 @@ async def get_multi_asset_snapshot(
             return None
 
     async def stock_snap(ticker: str) -> dict | None:
+        if _has_alpaca_credentials():
+            try:
+                t = await _alpaca_stock_ticker(ticker)
+                if t and t.get("last"):
+                    return {
+                        "symbol": ticker, "asset_class": "equity",
+                        "price": t["last"], "change_pct": t.get("change_pct_24h"),
+                        "volume_24h": t.get("volume_24h"),
+                        "high_24h": t.get("high_24h"), "low_24h": t.get("low_24h"),
+                        "exchange": "alpaca",
+                    }
+            except Exception as e:
+                log.debug(f"Alpaca snapshot {ticker}: {e}")
         if not _yf_ready():
             return None
         try:

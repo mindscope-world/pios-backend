@@ -4,6 +4,7 @@ Broker adapter factory.
 Each adapter wraps a specific broker SDK behind a common interface.
 Traders register their own brokers; this service manages the lifecycle.
 """
+import asyncio
 import json
 import time
 import uuid
@@ -92,20 +93,65 @@ class AlpacaAdapter(BrokerAdapter):
         a = client.get_account()
         return {"buying_power": float(a.buying_power), "equity": float(a.equity)}
 
+    @staticmethod
+    def _alpaca_symbol(symbol: str) -> str:
+        """
+        App symbol → Alpaca symbol. Alpaca quotes crypto against USD, and a
+        (paper) account funds trades from its USD buying power — it holds no
+        USDT/USDC, so sending "BTC/USDT" verbatim gets rejected with
+        "insufficient balance for USDT". Map USDT/USDC-quoted pairs to the
+        /USD pair (mirrors the market-data routing in market_data_service).
+        Equities pass through unchanged.
+        """
+        s = symbol.strip().upper()
+        if "/" in s:
+            base, quote = s.split("/", 1)
+            if quote in ("USDT", "USDC"):
+                quote = "USD"
+            return f"{base}/{quote}"
+        return s
+
+    @staticmethod
+    def _order_status(result) -> str:
+        return str(getattr(result.status, "value", result.status)).upper()
+
     async def submit_order(self, order: Order) -> dict:
         from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
         client = await self._client()
         side = OrderSide.BUY if order.side == "BUY" else OrderSide.SELL
         tif  = TimeInForce.GTC
+        symbol = self._alpaca_symbol(order.symbol.symbol)
 
         if order.order_type == "MARKET":
-            req = MarketOrderRequest(symbol=order.symbol.symbol, qty=order.qty, side=side, time_in_force=tif)
+            req = MarketOrderRequest(symbol=symbol, qty=float(order.qty), side=side, time_in_force=tif)
         else:
-            req = LimitOrderRequest(symbol=order.symbol.symbol, qty=order.qty, side=side, limit_price=order.price, time_in_force=tif)
+            req = LimitOrderRequest(symbol=symbol, qty=float(order.qty), side=side, limit_price=float(order.price), time_in_force=tif)
 
-        result = client.submit_order(req)
-        return {"broker_order_id": str(result.id), "status": str(result.status)}
+        # TradingClient is synchronous — keep it off the event loop
+        result = await asyncio.to_thread(client.submit_order, req)
+
+        # Poll briefly toward a terminal state: marketable orders fill within
+        # ~a second, and there is no fill-sync loop for Alpaca — an order
+        # acknowledged as 'accepted'/'pending_new' would otherwise sit
+        # SUBMITTED in the app forever even though it filled at the broker.
+        status = self._order_status(result)
+        for attempt in range(10):
+            if status == "FILLED":
+                return {
+                    "broker_order_id": str(result.id),
+                    "status": "FILLED",
+                    "avg_price": float(result.filled_avg_price or 0),
+                }
+            if status in ("REJECTED", "CANCELED", "EXPIRED"):
+                raise RuntimeError(f"Alpaca order {status.lower()} (broker order {result.id})")
+            if attempt < 9:
+                await asyncio.sleep(0.5)
+                result = await asyncio.to_thread(client.get_order_by_id, result.id)
+                status = self._order_status(result)
+
+        # Still working (e.g. a resting LIMIT) — hand back as submitted
+        return {"broker_order_id": str(result.id), "status": status}
 
     async def cancel_order(self, broker_order_id: str) -> dict:
         client = await self._client()

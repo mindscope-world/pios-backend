@@ -111,3 +111,23 @@ async def get_primary_with_ticks(
         return None, []
     ticks = await recent_ticks(db, sym.id, n_ticks)
     return sym, ticks or []
+
+
+async def get_symbol_with_ticks(
+    db: AsyncSession,
+    symbol: str | None,
+    n_ticks: int = 200,
+) -> tuple[Symbol | None, list]:
+    """
+    Like get_primary_with_ticks, but honors an explicit symbol name when
+    given (falling back to the primary symbol when None). Worker-safe: an
+    unknown symbol returns (None, []) rather than raising HTTPException.
+    """
+    if not symbol:
+        return await get_primary_with_ticks(db, n_ticks)
+    result = await db.execute(select(Symbol).where(Symbol.symbol == symbol))
+    sym = result.scalar_one_or_none()
+    if sym is None:
+        return None, []
+    ticks = await recent_ticks(db, sym.id, n_ticks)
+    return sym, ticks or []

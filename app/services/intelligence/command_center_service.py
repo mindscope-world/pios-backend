@@ -5,7 +5,7 @@ from fastapi import HTTPException
 import numpy as np
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.helpers.helpers import latest_regime, open_positions, primary_symbol, recent_ticks, get_primary_with_ticks, safe_float, now_iso,safe_ms
+from app.helpers.helpers import latest_regime, open_positions, primary_symbol, recent_ticks, get_primary_with_ticks, get_symbol_with_ticks, safe_float, now_iso,safe_ms
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.all_models import PnLSnapshot, Strategy
@@ -67,14 +67,18 @@ from app.services.quant_engine import build_quant_core_gates, estimate_volatilit
 #         },
 #         "evaluated_at": datetime.now(timezone.utc).isoformat(),
 #     }
-async def compute_command_center_current(current_user, db) -> dict:
+async def compute_command_center_current(current_user, db, symbol: str | None = None) -> dict:
     """
-    Full Quant Core decision pipeline for the primary symbol.
-    Worker-friendly: (current_user, db) only, no FastAPI deps.
+    Full Quant Core decision pipeline for one symbol (explicit `symbol`, or
+    the primary symbol when None). Worker-friendly: no FastAPI deps.
     Never raises.
+
+    The worker calls this once per symbol and caches under that symbol's
+    key — before `symbol` existed it always computed the primary symbol,
+    so command_center:EURUSD contained BTC/USDT data.
     """
-    try: 
-        sym, ticks = await get_primary_with_ticks(db, 200)
+    try:
+        sym, ticks = await get_symbol_with_ticks(db, symbol, 200)
         if sym is None:
             return {
                 "error": "no_primary_symbol",

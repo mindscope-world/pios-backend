@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     ALPACA_API_KEY:    str = ""
     ALPACA_API_SECRET: str = ""
     ALPACA_PAPER:      bool = True   # True = paper trading endpoint
+    ALPACA_DATA_FEED:  str = "iex"   # iex (free) | sip (paid data subscription)
 
     # OANDA market data fallback for forex ticks and candles
     OANDA_API_KEY:      str = ""

@@ -8,7 +8,7 @@ positions, orders, strategies, fills, backtest_jobs).  No stubs.
 from __future__ import annotations
 
 import asyncio
-from asyncio import log
+import logging
 import json as _json
 import math
 import statistics
@@ -44,6 +44,12 @@ from app.services.market_data_service import (
 )
 
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
+
+# This was `from asyncio import log` (the asyncio.log *module*, an IDE
+# auto-import accident) — every log.debug() call then raised AttributeError,
+# and since several sit inside the SSE generators' exception handlers, a
+# routine handled error (e.g. a 3s ticker timeout) killed the whole stream.
+log = logging.getLogger(__name__)
 
 
 def _normalize_symbol_key(symbol: str) -> str:

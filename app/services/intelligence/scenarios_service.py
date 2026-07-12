@@ -1,18 +1,19 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.helpers.helpers import get_primary_with_ticks, now_iso, safe_float
+from app.helpers.helpers import get_primary_with_ticks, get_symbol_with_ticks, now_iso, safe_float
 from app.models.all_models import User
 from app.services.quant_engine import estimate_volatility_garch, run_monte_carlo
 
-async def compute_scenarios(current_user: User, db: AsyncSession) -> dict:
+async def compute_scenarios(current_user: User, db: AsyncSession, symbol: str | None = None) -> dict:
     """
     Bull / base / bear scenario cards + stress-test table.
     Powered by Monte Carlo (numpy log-normal paths) with GARCH vol.
-    Auto-detects primary symbol.
- 
+    Uses the explicit `symbol` when given (the worker passes each symbol it
+    caches under), auto-detecting the primary symbol otherwise.
+
     Returns a fully-populated dict; never raises.
     """
     try:
-        sym, ticks = await get_primary_with_ticks(db, 500)
+        sym, ticks = await get_symbol_with_ticks(db, symbol, 500)
  
         if sym is None:
             return {

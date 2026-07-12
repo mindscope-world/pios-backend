@@ -283,5 +283,7 @@ wrapt==2.1.2
 xlsxwriter==3.2.9
 xxhash==3.6.0
 yarl==1.23.0
-yfinance==0.2.40
+# 1.x uses curl_cffi browser impersonation for Yahoo's cookie/crumb auth —
+# 0.2.40 was getting plain-text 429s (see market_data_service.py's breaker).
+yfinance==1.5.1
 zipp==3.23.1
