@@ -323,6 +323,53 @@ def _alpaca_headers() -> dict[str, str]:
     }
 
 
+async def list_alpaca_crypto_symbols() -> list[dict]:
+    """
+    Every crypto currency Alpaca currently lists as tradable, one entry per
+    *base* asset — Alpaca lists the same base against several quotes (USD,
+    USDC, USDT: e.g. BTC/USD, BTC/USDC, BTC/USDT all exist), which would
+    look like duplicate "currencies" if surfaced per-pair rather than
+    deduped to the underlying asset.
+
+    Symbols are returned in the app's established /USDT quote convention
+    (matching the existing seeded BTC/USDT symbol) regardless of which
+    quote Alpaca itself lists first — order submission and market-data
+    fetches already translate that back to whatever Alpaca/ccxt actually
+    wants (AlpacaAdapter._alpaca_symbol, _alpaca_crypto_candidates), so the
+    quote shown here doesn't need to match Alpaca's own listing.
+
+    Uses the Trading API's asset list (alpaca-py's TradingClient, same SDK
+    broker_service.py already depends on) rather than the data REST calls
+    the rest of this module uses — this is asset metadata, not price data.
+    Cached for an hour: Alpaca's crypto listing changes rarely and this is
+    a full-account API call, not a per-symbol one.
+    """
+    cached = _ttl_get("alpaca_crypto_symbols", 3600)
+    if cached is not None:
+        return cached
+    if not _has_alpaca_credentials():
+        return []
+    try:
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.enums import AssetClass
+        from alpaca.trading.requests import GetAssetsRequest
+
+        client = TradingClient(settings.ALPACA_API_KEY, settings.ALPACA_API_SECRET, paper=settings.ALPACA_PAPER)
+        req = GetAssetsRequest(asset_class=AssetClass.CRYPTO)
+        assets = await asyncio.to_thread(client.get_all_assets, req)
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"Alpaca crypto asset list: {e}")
+        return []
+
+    bases = sorted({
+        a.symbol.split("/")[0] for a in assets
+        if a.tradable and str(getattr(a.status, "value", a.status)).lower() == "active"
+    })
+    result = [{"symbol": f"{b}/USDT", "base": b} for b in bases]
+    _ttl_set("alpaca_crypto_symbols", result)
+    return result
+
+
 def _is_equity_symbol(symbol: str) -> bool:
     """
     Plain US tickers (AAPL, SPY, BRK.B). Excludes pairs (anything with a

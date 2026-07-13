@@ -125,6 +125,50 @@ class AlpacaAdapter(BrokerAdapter):
             "avg_price": float(o.filled_avg_price or 0),
         }
 
+    async def get_order_fills(self, broker_order_id: str, since: datetime | None = None) -> list[dict]:
+        """
+        Individual per-execution fills for one order, oldest first.
+
+        The order object (get_order/get_order_by_id) only ever exposes the
+        *cumulative* filled_qty and a running average price — if several
+        fills land between two reconciliation passes (e.g. the trade-update
+        stream was disconnected, or the 15s poller just happened to catch
+        two prints at once), there's no way to recover the individual print
+        prices from it. Alpaca's Account Activities API does carry them, so
+        the fill-sync loop calls this to replay each execution as its own
+        Fill row instead of collapsing them into one delta at the average.
+
+        No documented `order_id` filter on this endpoint, so activities are
+        fetched by date range (`since`, defaulting to the order's own
+        lifetime — callers pass the order's created_at) and filtered
+        client-side; a paper/dev order's activity list is small enough that
+        this is cheap. Returns [] on any failure so callers can fall back
+        to the single-delta-at-average behavior rather than lose the fill.
+        """
+        client = await self._client()
+        params: dict = {"direction": "asc", "page_size": 100}
+        if since is not None:
+            params["after"] = since.isoformat()
+        try:
+            activities = await asyncio.to_thread(client.get, "/account/activities/FILL", params)
+        except Exception:
+            return []
+        fills = []
+        for a in activities or []:
+            if not isinstance(a, dict) or a.get("order_id") != broker_order_id:
+                continue
+            try:
+                fills.append({
+                    "id": a.get("id"),
+                    "price": float(a["price"]),
+                    "qty": float(a["qty"]),
+                    "transaction_time": a.get("transaction_time") or "",
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        fills.sort(key=lambda f: f["transaction_time"])
+        return fills
+
     async def _sellable_qty(self, client, symbol: str, requested: float) -> float:
         """
         Alpaca takes the crypto taker fee in the *base* asset, so after

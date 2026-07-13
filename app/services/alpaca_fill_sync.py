@@ -8,8 +8,12 @@ get_fills() implementation — previously stayed SUBMITTED in the app forever
 even after filling at the broker. This loop closes that gap: every
 ALPACA_FILL_SYNC_INTERVAL_SECS it scans open (SUBMITTED/PARTIAL) non-algo
 orders on ALPACA brokers, asks Alpaca for their current state, and applies
-exactly the bookkeeping the instant-fill path does — Fill row for the newly
-executed delta, position netting, PnL snapshot, state transition, WS push.
+exactly the bookkeeping the instant-fill path does — Fill row(s) for the
+newly executed delta, position netting, PnL snapshot, state transition, WS
+push. When several fills land between two passes (stream disconnected, or
+just unlucky timing), each is replayed as its own Fill at its own execution
+price via Alpaca's Account Activities API (AlpacaAdapter.get_order_fills)
+rather than collapsed into one delta at the broker's running average.
 
 Runs inside the API process (started from main.py's lifespan), same as the
 algo slice executor: per-iteration sessions, and each order is re-read
@@ -102,43 +106,75 @@ async def _sync_order(
         changed = False
 
         if newly_filled > 1e-12 and avg_price > 0:
-            # One Fill row for the delta since the last sync, then the same
-            # bookkeeping chain as every other fill-writing path. Stream
-            # events carry the actual execution print — use its price when
-            # it covers the whole delta (no events missed in between);
-            # otherwise fall back to the broker's running average.
-            fill_price = avg_price
+            # Stream events carry the actual execution print — when its qty
+            # covers the whole delta unambiguously, that's one real Fill row
+            # at its own price, no API call needed. Otherwise (poller-driven,
+            # or several fills batched between two passes) replay Alpaca's
+            # own per-execution activity records so each print gets its own
+            # Fill row instead of collapsing them into one delta at the
+            # broker's running average.
             if (
                 execution
                 and float(execution.get("price") or 0) > 0
                 and abs(float(execution.get("qty") or 0) - newly_filled)
                 <= max(newly_filled * 1e-6, 1e-12)
             ):
-                fill_price = float(execution["price"])
-            commission = newly_filled * fill_price * 0.001
-            db.add(Fill(
-                order_id=order.id,
-                symbol_id=order.symbol_id,
-                side=order.side,
-                qty=newly_filled,
-                price=fill_price,
-                commission=commission,
-                total_cost=commission,
-            ))
-            await apply_fill_to_position(
-                db,
-                user_id=order.user_id,
-                broker_id=order.broker_id,
-                strategy_id=order.strategy_id,
-                symbol_id=order.symbol_id,
-                side=order.side,
-                qty=newly_filled,
-                price=fill_price,
-                commission=commission,
-            )
+                executions = [{"qty": newly_filled, "price": float(execution["price"])}]
+            else:
+                adapter_for_fills = get_adapter(order.broker)
+                executions = []
+                if isinstance(adapter_for_fills, AlpacaAdapter):
+                    prior_filled = float(order.filled_qty or 0)
+                    raw = await adapter_for_fills.get_order_fills(
+                        order.broker_order_id, since=order.created_at
+                    )
+                    running = 0.0
+                    for f in raw:
+                        prev_running = running
+                        running += f["qty"]
+                        if running <= prior_filled + 1e-9:
+                            continue  # fully accounted for by an earlier sync
+                        contributed = running - max(prev_running, prior_filled)
+                        if contributed > 1e-12:
+                            executions.append({"qty": contributed, "price": f["price"]})
+                covered = sum(e["qty"] for e in executions)
+                remainder = newly_filled - covered
+                if remainder > 1e-9:
+                    # Activities API came back short of the order's own
+                    # cumulative filled_qty (a fetch failure, or Alpaca's
+                    # eventual-consistency lag) — don't lose the fill,
+                    # record what's left at the broker's running average.
+                    executions.append({"qty": remainder, "price": avg_price})
+
+            for ex in executions:
+                ex_qty, ex_price = ex["qty"], ex["price"]
+                commission = ex_qty * ex_price * 0.001
+                db.add(Fill(
+                    order_id=order.id,
+                    symbol_id=order.symbol_id,
+                    side=order.side,
+                    qty=ex_qty,
+                    price=ex_price,
+                    commission=commission,
+                    total_cost=commission,
+                ))
+                await apply_fill_to_position(
+                    db,
+                    user_id=order.user_id,
+                    broker_id=order.broker_id,
+                    strategy_id=order.strategy_id,
+                    symbol_id=order.symbol_id,
+                    side=order.side,
+                    qty=ex_qty,
+                    price=ex_price,
+                    commission=commission,
+                )
+                prior_notional = order.filled_qty * (order.avg_fill_price or 0)
+                new_filled = order.filled_qty + ex_qty
+                order.avg_fill_price = (prior_notional + ex_qty * ex_price) / new_filled
+                order.filled_qty = new_filled
+
             await write_pnl_snapshot(db, order.user_id)
-            order.filled_qty = broker_filled
-            order.avg_fill_price = avg_price
             changed = True
 
         if status == "FILLED":

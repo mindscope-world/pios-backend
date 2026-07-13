@@ -39,6 +39,7 @@ from app.services.market_data_service import (
     get_live_ticker, get_ohlcv, get_orderbook, get_recent_trades,
     compute_technical_indicators, get_multi_asset_snapshot,
     get_market_breadth, get_funding_rates, live_price_stream,
+    list_alpaca_crypto_symbols,
     CORE_CRYPTO_SYMBOLS, CORE_FOREX_PAIRS, CORE_STOCK_TICKERS,
     DEFAULT_CRYPTO_EXCHANGE,
 )
@@ -551,6 +552,57 @@ async def market_trades(
         "symbol":  symbol,
         "trades":  trades,
         "summary": summary,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OHLCV — raw candles for charting (Execution page price chart)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/market/ohlcv")
+async def market_ohlcv(
+    symbol: str         = Query(...),
+    timeframe: str      = Query("1h"),
+    limit: int          = Query(200, ge=10, le=500),
+    current_user: User  = Depends(get_current_user),
+):
+    """
+    Raw OHLCV candles for a symbol, domain-routed the same way every other
+    market-data endpoint is (OANDA for forex/metals, Alpaca for equities,
+    ccxt for crypto — see market_data_service.get_ohlcv). Distinct from
+    /market/indicators, which computes-and-discards candles into derived
+    indicators only; this returns the candles themselves for charting.
+    """
+    candles = await get_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candles": candles,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ALPACA CRYPTO SYMBOLS — full tradable-currency list (Execution page chips)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/market/crypto-symbols")
+async def market_crypto_symbols(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Every crypto currency Alpaca currently lists as tradable, one entry per
+    base asset — see market_data_service.list_alpaca_crypto_symbols for the
+    dedup rationale. Powers the Execution page's symbol switcher so it
+    always reflects Alpaca's real current listing rather than a hardcoded
+    subset. Honestly empty (not an error) when Alpaca credentials aren't
+    configured.
+    """
+    symbols = await list_alpaca_crypto_symbols()
+    return {
+        "symbols": symbols,
+        "count": len(symbols),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
