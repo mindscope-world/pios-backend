@@ -34,14 +34,27 @@ async def lifespan(app: FastAPI):
     app.state.redis_listener = asyncio.create_task(start_redis_listener())
     logger.info("Redis listener started")
 
+    # Reconcile open Alpaca orders with the broker (resting LIMITs that fill
+    # after submit-time polling, broker-side cancels) — see alpaca_fill_sync.py
+    from app.services.alpaca_fill_sync import run_alpaca_fill_sync
+    app.state.alpaca_fill_sync = asyncio.create_task(run_alpaca_fill_sync())
+
+    # Trade-update WebSocket stream — instant fills/cancels; the poll loop
+    # above remains the safety net (see alpaca_trade_stream.py)
+    from app.services.alpaca_trade_stream import run_alpaca_trade_streams
+    app.state.alpaca_trade_stream = asyncio.create_task(run_alpaca_trade_streams())
+
     logger.info("Pi OS API ready")
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
-    app.state.redis_listener.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await app.state.redis_listener
-        
+    for task_name in ("redis_listener", "alpaca_fill_sync", "alpaca_trade_stream"):
+        task = getattr(app.state, task_name, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     await engine.dispose()
     logger.info("Pi OS API shutdown complete")
 

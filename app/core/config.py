@@ -78,6 +78,12 @@ class Settings(BaseSettings):
     ALPACA_API_SECRET: str = ""
     ALPACA_PAPER:      bool = True   # True = paper trading endpoint
     ALPACA_DATA_FEED:  str = "iex"   # iex (free) | sip (paid data subscription)
+    # How often the API process reconciles open Alpaca orders with the broker
+    # (resting LIMITs that fill after submit-time polling; broker-side cancels)
+    ALPACA_FILL_SYNC_INTERVAL_SECS: int = 15
+    # Trade-update WebSocket stream: pushes fills/cancels the instant they
+    # happen at Alpaca; the poll loop above stays on as the safety net
+    ALPACA_TRADE_STREAM_ENABLED: bool = True
 
     # OANDA market data fallback for forex ticks and candles
     OANDA_API_KEY:      str = ""

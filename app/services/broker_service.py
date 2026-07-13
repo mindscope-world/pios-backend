@@ -115,6 +115,33 @@ class AlpacaAdapter(BrokerAdapter):
     def _order_status(result) -> str:
         return str(getattr(result.status, "value", result.status)).upper()
 
+    async def get_order(self, broker_order_id: str) -> dict:
+        """Broker-side view of one order — consumed by the fill-sync loop."""
+        client = await self._client()
+        o = await asyncio.to_thread(client.get_order_by_id, broker_order_id)
+        return {
+            "status": self._order_status(o),
+            "filled_qty": float(o.filled_qty or 0),
+            "avg_price": float(o.filled_avg_price or 0),
+        }
+
+    async def _sellable_qty(self, client, symbol: str, requested: float) -> float:
+        """
+        Alpaca takes the crypto taker fee in the *base* asset, so after
+        buying 0.0005 BTC only ~0.00049875 is sellable — "sell exactly what
+        I bought" rejects on insufficient balance. When the shortfall is
+        fee-sized (≤2%), clamp the sell to what the account actually holds;
+        anything larger is a genuine oversell and is left to reject honestly.
+        """
+        try:
+            pos = await asyncio.to_thread(client.get_open_position, symbol.replace("/", ""))
+            available = float(getattr(pos, "qty_available", None) or pos.qty or 0)
+        except Exception:
+            return requested
+        if 0 < available < requested and available >= requested * 0.98:
+            return available
+        return requested
+
     async def submit_order(self, order: Order) -> dict:
         from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -122,11 +149,14 @@ class AlpacaAdapter(BrokerAdapter):
         side = OrderSide.BUY if order.side == "BUY" else OrderSide.SELL
         tif  = TimeInForce.GTC
         symbol = self._alpaca_symbol(order.symbol.symbol)
+        qty = float(order.qty)
+        if side == OrderSide.SELL and "/" in symbol:
+            qty = await self._sellable_qty(client, symbol, qty)
 
         if order.order_type == "MARKET":
-            req = MarketOrderRequest(symbol=symbol, qty=float(order.qty), side=side, time_in_force=tif)
+            req = MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=tif)
         else:
-            req = LimitOrderRequest(symbol=symbol, qty=float(order.qty), side=side, limit_price=float(order.price), time_in_force=tif)
+            req = LimitOrderRequest(symbol=symbol, qty=qty, side=side, limit_price=float(order.price), time_in_force=tif)
 
         # TradingClient is synchronous — keep it off the event loop
         result = await asyncio.to_thread(client.submit_order, req)
@@ -142,6 +172,7 @@ class AlpacaAdapter(BrokerAdapter):
                     "broker_order_id": str(result.id),
                     "status": "FILLED",
                     "avg_price": float(result.filled_avg_price or 0),
+                    "filled_qty": float(result.filled_qty or qty),
                 }
             if status in ("REJECTED", "CANCELED", "EXPIRED"):
                 raise RuntimeError(f"Alpaca order {status.lower()} (broker order {result.id})")
@@ -160,10 +191,11 @@ class AlpacaAdapter(BrokerAdapter):
 
     async def get_positions(self) -> list[dict]:
         client = await self._client()
+        positions = await asyncio.to_thread(client.get_all_positions)
         return [
             {"symbol": p.symbol, "qty": float(p.qty), "side": "LONG" if float(p.qty) > 0 else "SHORT",
-             "avg_entry_price": float(p.avg_entry_price), "unrealized_pl": float(p.unrealized_pl)}
-            for p in client.get_all_positions()
+             "avg_entry_price": float(p.avg_entry_price), "unrealized_pl": float(p.unrealized_pl or 0)}
+            for p in positions
         ]
 
     async def get_fills(self, since: datetime | None = None) -> list[dict]:

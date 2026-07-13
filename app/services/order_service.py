@@ -188,19 +188,27 @@ async def submit_order(
             # If paper/instant fill
             if broker_result.get("status") == "FILLED":
                 fill_price = float(broker_result.get("avg_price") or data.price or 0)
+                # Real brokers may execute slightly less than requested (e.g.
+                # Alpaca clamps crypto sells to the fee-reduced base balance)
+                # — record what actually traded, not what was asked for.
+                fill_qty = float(broker_result.get("filled_qty") or data.qty)
                 fill = Fill(
                     order_id=order.id,
                     symbol_id=symbol.id,
                     side=data.side,
-                    qty=data.qty,
+                    qty=fill_qty,
                     price=fill_price,
-                    commission=data.qty * fill_price * 0.001,  # 0.1% default
-                    total_cost=data.qty * fill_price * 0.001,
+                    commission=fill_qty * fill_price * 0.001,  # 0.1% default
+                    total_cost=fill_qty * fill_price * 0.001,
                 )
                 db.add(fill)
-                order.filled_qty = data.qty
+                order.filled_qty = fill_qty
                 order.avg_fill_price = fill_price
-                order.transition("FILLED")
+                order.transition(
+                    "FILLED",
+                    f"Filled {fill_qty} of {data.qty} (broker balance/fee adjustment)"
+                    if fill_qty < float(data.qty) else None,
+                )
                 order.filled_at = datetime.now(timezone.utc)
                 # Net the fill into the trader's own Position row and append
                 # an equity-curve point -- Fill rows are the only source of
@@ -213,7 +221,7 @@ async def submit_order(
                     strategy_id=data.strategy_id,
                     symbol_id=symbol.id,
                     side=data.side,
-                    qty=data.qty,
+                    qty=fill_qty,
                     price=fill_price,
                     commission=fill.commission,
                 )

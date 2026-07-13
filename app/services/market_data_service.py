@@ -468,6 +468,23 @@ async def _alpaca_crypto_ohlcv(symbol: str, timeframe: str, limit: int) -> list[
     return []
 
 
+async def _alpaca_market_open() -> bool | None:
+    """US market open right now? (Alpaca trading-API clock, 60s cached.)
+    None when the clock can't be fetched — callers should not assume."""
+    cached = _ttl_get("alpaca_clock", 60)
+    if cached is not None:
+        return cached
+    base = "https://paper-api.alpaca.markets" if settings.ALPACA_PAPER else "https://api.alpaca.markets"
+    try:
+        data = await _alpaca_get(f"{base}/v2/clock")
+        is_open = bool(data.get("is_open"))
+        _ttl_set("alpaca_clock", is_open)
+        return is_open
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"Alpaca clock: {e}")
+        return None
+
+
 async def _alpaca_stock_orderbook(symbol: str) -> dict | None:
     """Alpaca has no L2 book for stocks — synthesize a one-level book from
     the NBBO quote, same trick as the OANDA forex branch."""
@@ -1003,6 +1020,10 @@ async def get_orderbook(
                     return payload
             except Exception as e:
                 log.debug(f"Alpaca orderbook {symbol}: {e}")
+            # IEX quotes zero out when the US market is closed — tell the
+            # caller *why* the book is empty instead of a generic error
+            if await _alpaca_market_open() is False:
+                return {"symbol": symbol, "error": "equity_market_closed"}
             return {"symbol": symbol, "error": "orderbook_unavailable"}
         return {"symbol": symbol, "error": "alpaca_credentials_missing"}
 
