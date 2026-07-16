@@ -55,11 +55,19 @@ async def primary_symbol(db: AsyncSession) -> Symbol | None:
 
 
 async def get_symbol_by_name(db: AsyncSession, symbol: str) -> Symbol:
-    result = await db.execute(select(Symbol).where(Symbol.symbol == symbol))
-    sym = result.scalar_one_or_none()
-    if not sym:
-        raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found")
-    return sym
+    # Forex/metal rows use the slash-less convention (EURUSD, XAUUSD) while
+    # the UI sends slashed pairs (EUR/USD) — accept both, like the market-data
+    # layer does.
+    candidates = [symbol]
+    stripped = symbol.replace("/", "")
+    if stripped != symbol:
+        candidates.append(stripped)
+    result = await db.execute(select(Symbol).where(Symbol.symbol.in_(candidates)))
+    syms = {s.symbol: s for s in result.scalars().all()}
+    for candidate in candidates:
+        if candidate in syms:
+            return syms[candidate]
+    raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found")
 
 
 async def recent_ticks(db: AsyncSession, symbol_id: int, limit: int = 200) -> list[MarketTick]:

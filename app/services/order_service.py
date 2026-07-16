@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.helpers.helpers import get_symbol_by_name
 from app.models.all_models import Order, Fill, Symbol, Broker, RiskLimit, Alert, OrderStatus
 from app.schemas.all_schemas import OrderCreate, TCAReport, _ALGORITHMIC_ORDER_TYPES
 from app.services.broker_service import get_adapter, get_broker_or_404
@@ -110,11 +111,8 @@ async def submit_order(
     # 1. Load broker (owner-scoped)
     broker = await get_broker_or_404(db, data.broker_id, user_id, user_role)
 
-    # 2. Resolve symbol
-    sym_result = await db.execute(select(Symbol).where(Symbol.symbol == data.symbol))
-    symbol = sym_result.scalar_one_or_none()
-    if not symbol:
-        raise HTTPException(status_code=404, detail=f"Symbol '{data.symbol}' not found")
+    # 2. Resolve symbol (accepts both EUR/USD and EURUSD conventions)
+    symbol = await get_symbol_by_name(db, data.symbol)
 
     # 3. Risk gate. The idempotency check here is a fast-path SELECT --
     # it catches a retried key immediately in the common case, but two
