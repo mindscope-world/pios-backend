@@ -17,7 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.helpers.helpers import get_symbol_by_name
 from app.models.all_models import Order, Fill, Symbol, Broker, RiskLimit, Alert, OrderStatus
-from app.schemas.all_schemas import OrderCreate, TCAReport, _ALGORITHMIC_ORDER_TYPES
+from app.schemas.all_schemas import OrderCreate, TCAReport, _ALGORITHMIC_ORDER_TYPES, _CONDITIONAL_ORDER_TYPES
 from app.services.broker_service import get_adapter, get_broker_or_404
 from app.services.execution_algo import run_algo_order
 from app.services.audit_service import write_audit
@@ -114,6 +114,20 @@ async def submit_order(
     # 2. Resolve symbol (accepts both EUR/USD and EURUSD conventions)
     symbol = await get_symbol_by_name(db, data.symbol)
 
+    # Conditional types are armed app-side and fired by the trigger monitor
+    # (conditional_orders.py) — both prices must exist up front.
+    if data.order_type in _CONDITIONAL_ORDER_TYPES:
+        if not (data.price and data.price > 0):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{data.order_type} requires a limit price",
+            )
+        if not (data.stop_price and data.stop_price > 0):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{data.order_type} requires a stop trigger price",
+            )
+
     # 3. Risk gate. The idempotency check here is a fast-path SELECT --
     # it catches a retried key immediately in the common case, but two
     # requests carrying the same key racing concurrently can both pass it
@@ -174,6 +188,38 @@ async def submit_order(
         # for why -- the background task reads via its own session and
         # won't see an uncommitted row).
         pass
+    elif data.order_type in _CONDITIONAL_ORDER_TYPES:
+        # Held app-side: the conditional-order engine fires them at the
+        # broker when the trigger crosses (conditional_orders.py). For OCO
+        # the returned row is the LIMIT leg; a second, linked row is the
+        # stop leg — one filling cancels the other.
+        if data.order_type == "OCO":
+            group = str(order.id)
+            order.algo_config = {"oco_group": group, "oco_leg": "limit"}
+            order.stop_price = None  # this row is the limit leg
+            order.transition("SUBMITTED", f"OCO limit leg armed at {data.price}")
+            stop_leg = Order(
+                client_order_id=f"{order.client_order_id}-STP",
+                user_id=user_id,
+                broker_id=broker.id,
+                strategy_id=data.strategy_id,
+                symbol_id=symbol.id,
+                side=data.side,
+                order_type="OCO",
+                time_in_force=data.time_in_force,
+                qty=data.qty,
+                price=None,
+                stop_price=data.stop_price,
+                algo_config={"oco_group": group, "oco_leg": "stop"},
+                risk_check=risk,
+            )
+            stop_leg.transition("SUBMITTED", f"OCO stop leg armed at {data.stop_price}")
+            stop_leg.submitted_at = order.submitted_at
+            db.add(stop_leg)
+        else:
+            order.transition(
+                "SUBMITTED", f"Stop-limit armed — triggers at {data.stop_price}, limit {data.price}"
+            )
     else:
         # 5. Send to broker (single-shot, instant fill/reject)
         adapter = get_adapter(broker)
@@ -307,6 +353,31 @@ async def cancel_order(
 
     order.transition("CANCELLED", "User requested")
     order.cancelled_at = datetime.now(timezone.utc)
+
+    # OCO legs cancel as a pair — an orphaned sibling would otherwise keep
+    # watching its trigger with no counterpart.
+    oco_group = (order.algo_config or {}).get("oco_group")
+    if order.order_type == "OCO" and oco_group:
+        result = await db.execute(
+            select(Order)
+            .options(selectinload(Order.broker), selectinload(Order.events))
+            .where(
+                Order.order_type == "OCO",
+                Order.algo_config["oco_group"].as_string() == oco_group,
+                Order.id != order.id,
+                Order.status.in_((OrderStatus.SUBMITTED, OrderStatus.PARTIAL)),
+            )
+            .with_for_update(of=Order)
+        )
+        for sib in result.scalars().all():
+            if sib.broker_order_id:
+                adapter = get_adapter(sib.broker)
+                try:
+                    await adapter.cancel_order(sib.broker_order_id)
+                except Exception:
+                    pass
+            sib.transition("CANCELLED", "OCO pair cancelled by user")
+            sib.cancelled_at = datetime.now(timezone.utc)
 
     await write_audit(
         db, action="ORDER_CANCELLED", resource_type="order",

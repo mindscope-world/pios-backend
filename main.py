@@ -44,11 +44,22 @@ async def lifespan(app: FastAPI):
     from app.services.alpaca_trade_stream import run_alpaca_trade_streams
     app.state.alpaca_trade_stream = asyncio.create_task(run_alpaca_trade_streams())
 
+    # Conditional-order engine — STOP_LIMIT triggers + OCO linked legs
+    # (see conditional_orders.py)
+    from app.services.conditional_orders import run_conditional_orders
+    app.state.conditional_orders = asyncio.create_task(run_conditional_orders())
+
+    # Mark-to-market — periodic revaluation of open positions against live
+    # prices so unrealized P&L doesn't stale between fills (position_marks.py)
+    from app.services.position_marks import run_position_marks
+    app.state.position_marks = asyncio.create_task(run_position_marks())
+
     logger.info("Pi OS API ready")
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
-    for task_name in ("redis_listener", "alpaca_fill_sync", "alpaca_trade_stream"):
+    for task_name in ("redis_listener", "alpaca_fill_sync", "alpaca_trade_stream",
+                      "conditional_orders", "position_marks"):
         task = getattr(app.state, task_name, None)
         if task is not None:
             task.cancel()

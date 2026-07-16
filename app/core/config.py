@@ -84,6 +84,18 @@ class Settings(BaseSettings):
     # Trade-update WebSocket stream: pushes fills/cancels the instant they
     # happen at Alpaca; the poll loop above stays on as the safety net
     ALPACA_TRADE_STREAM_ENABLED: bool = True
+    # When Alpaca's Account Activities feed lags an order's own cumulative
+    # filled_qty (eventual consistency), keep the order open and retry for
+    # this long so each execution gets its real print price; only after the
+    # grace expires is the uncovered remainder recorded at the running average
+    ALPACA_ACTIVITY_LAG_GRACE_SECS: int = 45
+
+    # Conditional-order engine (STOP_LIMIT triggers, OCO linked legs): how
+    # often pending triggers are evaluated against live prices
+    CONDITIONAL_POLL_SECS: int = 5
+    # Mark-to-market job: how often open positions are revalued against live
+    # prices so unrealized P&L doesn't go stale between fills
+    MARK_TO_MARKET_INTERVAL_SECS: int = 60
 
     # OANDA market data fallback for forex ticks and candles
     OANDA_API_KEY:      str = ""

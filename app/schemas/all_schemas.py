@@ -151,10 +151,11 @@ class OrderCreate(BaseModel):
     )
     symbol: str
     side: str                              # BUY | SELL
-    # MARKET|LIMIT|STOP|STOP_LIMIT|TWAP|VWAP|OCO|ICEBERG -- NOTE: TWAP/VWAP/OCO/
-    # ICEBERG have no slicing/algorithmic execution engine yet and currently
-    # instant-fill exactly like MARKET (see OrderOut.execution_style below).
-    # Real execution algorithms are a planned Track B item, not yet built.
+    # MARKET|LIMIT|STOP|STOP_LIMIT|TWAP|VWAP|OCO|ICEBERG. TWAP/VWAP/ICEBERG
+    # execute as background slice schedules (execution_algo); STOP_LIMIT/OCO
+    # arm app-side and fire on trigger (conditional_orders) — STOP_LIMIT
+    # needs price+stop_price, OCO needs price (limit leg) + stop_price (stop
+    # leg) and creates two linked rows, one cancelling the other on fill.
     order_type: str = "MARKET"
     qty: float = Field(gt=0)
     price: float | None = None             # required for LIMIT / STOP_LIMIT
@@ -166,10 +167,15 @@ class OrderCreate(BaseModel):
                                             #  "display_qty": float (ICEBERG only)}
 
 # Order types with a real slicing/algorithmic execution engine wired in
-# (see app.services.execution_algo.run_algo_order). OCO has no engine yet
-# and still instant-fills like MARKET. Update this set as each algorithm
-# actually ships; nothing else needs to change.
+# (see app.services.execution_algo.run_algo_order). Update this set as each
+# algorithm actually ships; nothing else needs to change.
 _ALGORITHMIC_ORDER_TYPES: set[str] = {"TWAP", "VWAP", "ICEBERG"}
+
+# Order types armed app-side and fired by the trigger monitor
+# (app.services.conditional_orders): STOP_LIMIT rests until its stop crosses,
+# then goes to the broker as a LIMIT; OCO is two linked legs (limit + stop)
+# where one filling cancels the other.
+_CONDITIONAL_ORDER_TYPES: set[str] = {"STOP_LIMIT", "OCO"}
 
 class OrderOut(BaseModel):
     model_config = {"from_attributes": True}
@@ -183,6 +189,7 @@ class OrderOut(BaseModel):
     qty: float
     filled_qty: float
     price: float | None
+    stop_price: float | None
     avg_fill_price: float | None
     status: str
     state_history: list
@@ -197,13 +204,19 @@ class OrderOut(BaseModel):
     def execution_style(self) -> str:
         """
         "INSTANT" = filled immediately by the broker adapter in a single call
-        (MARKET/LIMIT/STOP/STOP_LIMIT/OCO -- OCO has no algorithm yet and
-        instant-fills like MARKET despite the label).
+        (MARKET/LIMIT/STOP).
         "ALGORITHMIC" = executed as a background slice schedule by
         app.services.execution_algo (TWAP/VWAP/ICEBERG) -- the order starts
         SUBMITTED with zero fills and walks to PARTIAL/FILLED as slices land.
+        "CONDITIONAL" = armed app-side and fired by the trigger monitor
+        (STOP_LIMIT/OCO, app.services.conditional_orders) -- the order rests
+        SUBMITTED with no broker_order_id until its trigger crosses.
         """
-        return "ALGORITHMIC" if self.order_type in _ALGORITHMIC_ORDER_TYPES else "INSTANT"
+        if self.order_type in _ALGORITHMIC_ORDER_TYPES:
+            return "ALGORITHMIC"
+        if self.order_type in _CONDITIONAL_ORDER_TYPES:
+            return "CONDITIONAL"
+        return "INSTANT"
 
 class FillOut(BaseModel):
     model_config = {"from_attributes": True}

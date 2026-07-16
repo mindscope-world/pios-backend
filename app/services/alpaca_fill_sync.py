@@ -15,6 +15,14 @@ just unlucky timing), each is replayed as its own Fill at its own execution
 price via Alpaca's Account Activities API (AlpacaAdapter.get_order_fills)
 rather than collapsed into one delta at the broker's running average.
 
+If the activities feed lags the order's own cumulative filled_qty (Alpaca
+eventual consistency, or a transient fetch failure), the uncovered
+remainder is *deferred* rather than immediately blended: the order is held
+open (PARTIAL) and retried each pass until the feed catches up, so every
+execution keeps its real print price. Only once
+ALPACA_ACTIVITY_LAG_GRACE_SECS has elapsed for that order is the remainder
+recorded at the broker's running average — the fill is never lost either way.
+
 Runs inside the API process (started from main.py's lifespan), same as the
 algo slice executor: per-iteration sessions, and each order is re-read
 with_for_update so a user cancel racing the sync can't corrupt the row.
@@ -26,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -44,6 +53,13 @@ _ALGO_TYPES = ("TWAP", "VWAP", "ICEBERG")
 
 # Broker statuses that end an order without (further) fills
 _TERMINAL_UNFILLED = {"CANCELED": "CANCELLED", "EXPIRED": "EXPIRED", "REJECTED": "REJECTED"}
+
+# order_id → monotonic time the activities feed was first seen lagging that
+# order's cumulative filled_qty. In-memory on purpose: the poller and the
+# trade-update stream share this process, and a restart merely restarts the
+# grace window (worst case the average-price fallback is deferred one more
+# ALPACA_ACTIVITY_LAG_GRACE_SECS).
+_activity_lag_first_seen: dict = {}
 
 
 async def _candidate_order_ids(db) -> list:
@@ -104,6 +120,7 @@ async def _sync_order(
 
         newly_filled = broker_filled - float(order.filled_qty or 0)
         changed = False
+        deferred_remainder = 0.0
 
         if newly_filled > 1e-12 and avg_price > 0:
             # Stream events carry the actual execution print — when its qty
@@ -142,9 +159,26 @@ async def _sync_order(
                 if remainder > 1e-9:
                     # Activities API came back short of the order's own
                     # cumulative filled_qty (a fetch failure, or Alpaca's
-                    # eventual-consistency lag) — don't lose the fill,
-                    # record what's left at the broker's running average.
-                    executions.append({"qty": remainder, "price": avg_price})
+                    # eventual-consistency lag). Don't blend the remainder
+                    # into one Fill at the running average immediately —
+                    # keep the order open and let the next pass replay it
+                    # once the feed catches up, so each execution keeps its
+                    # real print price. Only after the grace window is the
+                    # remainder recorded at the average (never lost).
+                    now = time.monotonic()
+                    first_seen = _activity_lag_first_seen.setdefault(order.id, now)
+                    if now - first_seen < settings.ALPACA_ACTIVITY_LAG_GRACE_SECS:
+                        deferred_remainder = remainder
+                        log.info(
+                            "alpaca_fill_sync: order %s activities feed short by %s "
+                            "(covered %s of %s) — deferring remainder for real prints",
+                            order_id, remainder, covered, newly_filled,
+                        )
+                    else:
+                        executions.append({"qty": remainder, "price": avg_price})
+                        _activity_lag_first_seen.pop(order.id, None)
+                else:
+                    _activity_lag_first_seen.pop(order.id, None)
 
             for ex in executions:
                 ex_qty, ex_price = ex["qty"], ex["price"]
@@ -177,9 +211,21 @@ async def _sync_order(
             await write_pnl_snapshot(db, order.user_id)
             changed = True
 
-        if status == "FILLED":
+        if status == "FILLED" and deferred_remainder > 0:
+            # Broker says done, but the activities feed hasn't yet produced
+            # the per-execution records for the whole delta — hold the order
+            # at PARTIAL so the next pass (or the grace-expiry fallback)
+            # finishes it; transitioning FILLED now would drop it from the
+            # sync scan with the remainder unrecorded.
+            if changed:
+                order.transition(
+                    "PARTIAL",
+                    f"Broker {source}; awaiting per-execution activity records",
+                )
+        elif status == "FILLED":
             order.transition("FILLED", f"Broker {source}")
             order.filled_at = datetime.now(timezone.utc)
+            _activity_lag_first_seen.pop(order.id, None)
             changed = True
         elif status == "PARTIALLY_FILLED" and changed:
             order.transition("PARTIAL", f"Broker {source}")
@@ -188,6 +234,7 @@ async def _sync_order(
             order.transition(app_status, f"Broker-side terminal state ({source})")
             if app_status == "REJECTED":
                 order.reject_reason = order.reject_reason or f"Rejected at broker ({source})"
+            _activity_lag_first_seen.pop(order.id, None)
             changed = True
 
         if not changed:
