@@ -1,6 +1,7 @@
 # app/core/security.py
 import hashlib
 import base64
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -33,8 +34,11 @@ def create_access_token(subject: str | Any, extra: dict | None = None) -> str:
 
 def create_refresh_token(subject: str | Any) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    # jti: exp has second resolution, so without it two logins for the same
+    # user inside one second mint byte-identical tokens — whose sha256 then
+    # collides with user_sessions' unique refresh_token_hash (login 500)
     return jwt.encode(
-        {"sub": str(subject), "exp": expire, "type": "refresh"},
+        {"sub": str(subject), "exp": expire, "type": "refresh", "jti": uuid.uuid4().hex},
         settings.SECRET_KEY, algorithm=settings.ALGORITHM,
     )
 

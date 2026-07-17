@@ -50,6 +50,11 @@ from app.schemas.all_schemas import BrokerTestResult
 
 log = logging.getLogger(__name__)
 
+# Fire-and-forget ORDER_UPDATE handler tasks — referenced here so the event
+# loop can't garbage-collect them mid-flight (same discipline as main.py's
+# app.state task refs).
+_push_tasks: set = set()
+
 
 def _order_to_ea_payload(order: Order, correlation_id: str) -> dict:
     """Convert an Order (or execution_algo._SliceOrder) to the EA wire format."""
@@ -134,11 +139,20 @@ class MT5Connection:
 
     def _dispatch(self, msg: dict) -> None:
         msg_type = msg.get("type")
-        if msg_type in ("ORDER_RESULT", "CANCEL_RESULT", "ACCOUNT_INFO", "POSITIONS", "PONG"):
+        if msg_type in ("ORDER_RESULT", "CANCEL_RESULT", "ACCOUNT_INFO", "POSITIONS",
+                        "ORDER_STATUS", "PONG"):
             correlation_id = msg.get("correlation_id")
             fut = self._pending.get(correlation_id)
             if fut and not fut.done():
                 fut.set_result(msg)
+        elif msg_type == "ORDER_UPDATE":
+            # Unsolicited push from the EA's OnTradeTransaction — a pending
+            # order filled (real print price inline) or died broker-side.
+            # Imported lazily: mt5_fill_sync imports this module at top level.
+            from app.services.mt5_fill_sync import handle_order_update
+            task = asyncio.create_task(handle_order_update(self.broker_id, msg))
+            _push_tasks.add(task)
+            task.add_done_callback(_push_tasks.discard)
         else:
             log.warning("[MT5:%s] Unknown message type: %s", self.broker_id, msg_type)
 
@@ -251,5 +265,30 @@ class MT5Adapter:
             return []
         return result.get("positions", [])
 
+    async def get_order(self, broker_order_id: str) -> Optional[dict]:
+        """Current state of one ticket, in the shape mt5_fill_sync expects:
+        {status, filled_qty, avg_price}. Status is app-vocabulary (SUBMITTED/
+        PARTIAL/FILLED/CANCELLED/EXPIRED/REJECTED, or UNKNOWN when the EA
+        can't place the ticket). None on timeout — the sync loop retries."""
+        conn = self._connection()
+        payload = {
+            "type":            "GET_ORDER",
+            "correlation_id":  f"stat-{broker_order_id}-{time.time()}",
+            "broker_order_id": broker_order_id,
+        }
+        try:
+            raw = await conn.send_request(payload, timeout=10.0)
+        except asyncio.TimeoutError:
+            return None
+        return {
+            "status":     raw.get("status"),
+            "filled_qty": raw.get("filled_qty"),
+            "avg_price":  raw.get("avg_fill_price"),
+        }
+
     async def get_fills(self, since: datetime | None = None) -> list[dict]:
-        return []  # the EA reports fills inline on ORDER_RESULT; no separate history request yet
+        # MARKET fills arrive inline on ORDER_RESULT; resting LIMIT/STOP
+        # fills sync via mt5_fill_sync.py (EA ORDER_UPDATE push + GET_ORDER
+        # poll), which applies them straight to orders/positions — nothing
+        # consumes a raw fill list for MT5.
+        return []

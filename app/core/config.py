@@ -90,6 +90,12 @@ class Settings(BaseSettings):
     # grace expires is the uncovered remainder recorded at the running average
     ALPACA_ACTIVITY_LAG_GRACE_SECS: int = 45
 
+    # MT5 EA bridge: how often open MT5 orders are reconciled with the
+    # terminal (pending LIMIT/STOP fills, broker-side cancels/expiries).
+    # The EA also pushes ORDER_UPDATE frames the instant a deal executes;
+    # this poll loop is the safety net (see mt5_fill_sync.py)
+    MT5_FILL_SYNC_INTERVAL_SECS: int = 15
+
     # Conditional-order engine (STOP_LIMIT triggers, OCO linked legs): how
     # often pending triggers are evaluated against live prices
     CONDITIONAL_POLL_SECS: int = 5
