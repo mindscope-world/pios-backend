@@ -50,6 +50,11 @@ async def lifespan(app: FastAPI):
     from app.services.mt5_fill_sync import run_mt5_fill_sync
     app.state.mt5_fill_sync = asyncio.create_task(run_mt5_fill_sync())
 
+    # Reconcile resting OANDA orders (pending LIMIT/STOP fills, broker-side
+    # cancels) — poll-only, no push channel; see oanda_fill_sync.py
+    from app.services.oanda_fill_sync import run_oanda_fill_sync
+    app.state.oanda_fill_sync = asyncio.create_task(run_oanda_fill_sync())
+
     # Conditional-order engine — STOP_LIMIT triggers + OCO linked legs
     # (see conditional_orders.py)
     from app.services.conditional_orders import run_conditional_orders
@@ -65,7 +70,8 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     for task_name in ("redis_listener", "alpaca_fill_sync", "alpaca_trade_stream",
-                      "mt5_fill_sync", "conditional_orders", "position_marks"):
+                      "mt5_fill_sync", "oanda_fill_sync", "conditional_orders",
+                      "position_marks"):
         task = getattr(app.state, task_name, None)
         if task is not None:
             task.cancel()

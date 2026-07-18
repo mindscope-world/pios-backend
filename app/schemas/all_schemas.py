@@ -84,7 +84,7 @@ class BrokerCreate(BaseModel):
     name: str
     broker_type: str
     exchange_id: str | None = None         # for CCXT
-    # Real adapters exist only for ALPACA/BINANCE/CCXT. For any other
+    # Real adapters exist only for ALPACA/BINANCE/CCXT/MT5/OANDA. For any other
     # broker_type, is_paper=True (the default) is required -- it's the explicit
     # acknowledgement that this connection will get simulated fills, not a real
     # broker integration. Setting is_paper=false for an unsupported type is

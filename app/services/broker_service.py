@@ -304,6 +304,240 @@ class CCXTAdapter(BrokerAdapter):
         return []
 
 
+# ── OANDA Adapter (v20 REST) ──────────────────────────────────────────────────
+
+class OandaAdapter(BrokerAdapter):
+    """
+    Order execution over OANDA's v20 REST API — the same API the app already
+    uses live for forex/metals market data (market_data_service).
+
+    Credentials are per-connection only: `api_key` + `account_id` from the
+    broker form (no fallback to the app's OANDA_* market-data env keys — that
+    would let any user's misconfigured connection trade on the operator's
+    account). `is_paper` picks the host: True → practice (fxpractice), False
+    → live (fxtrade), mirroring AlpacaAdapter's paper flag.
+
+    VOLUME SEMANTICS: OANDA sizes orders in whole UNITS of the base currency
+    (1 unit = 1 EUR on EUR_USD, 1 oz on XAU_USD; minimum 1). The app's qty is
+    sent as units after integer rounding; sub-1 quantities are rejected with
+    an explicit message rather than silently rounded to zero — a trader
+    thinking in lots (0.08) must not have that quietly become nothing.
+    """
+
+    _PRACTICE_BASE = "https://api-fxpractice.oanda.com/v3"
+    _LIVE_BASE = "https://api-fxtrade.oanda.com/v3"
+
+    def _base(self) -> str:
+        return self._PRACTICE_BASE if self.broker.is_paper else self._LIVE_BASE
+
+    def _account_id(self) -> str:
+        account_id = self.creds.get("account_id")
+        if not (self.creds.get("api_key") and account_id):
+            raise ConnectionError(
+                "OANDA credentials missing — this connection needs api_key and "
+                "account_id (set them on the broker in Connections)."
+            )
+        return account_id
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.creds.get('api_key')}",
+            "Accept-Datetime-Format": "RFC3339",
+            "Content-Type": "application/json",
+        }
+
+    async def _request(self, method: str, path: str, body: dict | None = None) -> dict:
+        import aiohttp
+        url = f"{self._base()}{path}"
+        async with aiohttp.ClientSession() as session:
+            async with session.request(
+                method, url, headers=self._headers(), json=body, timeout=15
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status >= 400:
+                    # v20 rejections carry the reason in orderRejectTransaction
+                    # or errorMessage — surface the most specific one.
+                    reject = (data or {}).get("orderRejectTransaction", {})
+                    detail = (
+                        reject.get("rejectReason")
+                        or (data or {}).get("errorMessage")
+                        or f"HTTP {response.status}"
+                    )
+                    raise ConnectionError(f"OANDA rejected: {detail}")
+                return data or {}
+
+    @staticmethod
+    def _instrument(symbol: str) -> str:
+        from app.services.market_data_service import _oanda_instrument
+        return _oanda_instrument(symbol)
+
+    @staticmethod
+    def _price_str(price: float) -> str:
+        # v20 wants DecimalNumber strings; trim to ≤5dp without trailing zeros
+        # (covers fx 5dp / JPY & metals 3dp). Excess precision from a hand-
+        # typed price comes back as an honest PRICE_PRECISION_EXCEEDED.
+        return f"{price:.5f}".rstrip("0").rstrip(".")
+
+    def _units(self, order: Order) -> int:
+        qty = float(order.qty)
+        units = int(round(qty))
+        if units < 1:
+            raise ConnectionError(
+                f"OANDA sizes orders in whole units of the base currency "
+                f"(minimum 1; e.g. 1000 = 1000 EUR on EUR/USD) — got {qty}."
+            )
+        return units if order.side == "BUY" else -units
+
+    async def test_connection(self) -> BrokerTestResult:
+        try:
+            t0 = time.perf_counter()
+            data = await self._request("GET", f"/accounts/{self._account_id()}/summary")
+            latency = (time.perf_counter() - t0) * 1000
+            a = data.get("account", {})
+            return BrokerTestResult(
+                success=True,
+                latency_ms=round(latency, 2),
+                message="Connected",
+                account_info={
+                    "balance": float(a.get("balance") or 0),
+                    "equity": float(a.get("NAV") or 0),
+                    "margin_available": float(a.get("marginAvailable") or 0),
+                    "currency": a.get("currency"),
+                    "open_trades": int(a.get("openTradeCount") or 0),
+                },
+            )
+        except Exception as e:
+            return BrokerTestResult(success=False, latency_ms=None, message=str(e))
+
+    async def get_account(self) -> dict:
+        data = await self._request("GET", f"/accounts/{self._account_id()}/summary")
+        a = data.get("account", {})
+        return {
+            "balance": float(a.get("balance") or 0),
+            "equity": float(a.get("NAV") or 0),
+            "buying_power": float(a.get("marginAvailable") or 0),
+            "currency": a.get("currency"),
+            "unrealized_pl": float(a.get("unrealizedPL") or 0),
+        }
+
+    async def submit_order(self, order: Order) -> dict:
+        units = self._units(order)
+        instrument = self._instrument(order.symbol.symbol)
+
+        spec: dict[str, Any] = {
+            "instrument": instrument,
+            "units": str(units),
+        }
+        if order.order_type == "MARKET":
+            spec["type"] = "MARKET"
+            spec["timeInForce"] = "FOK"
+        elif order.order_type == "LIMIT":
+            if not order.price:
+                raise ConnectionError("LIMIT order without a price")
+            spec["type"] = "LIMIT"
+            spec["price"] = self._price_str(float(order.price))
+            spec["timeInForce"] = "GTC"
+        elif order.order_type == "STOP":
+            trigger = float(order.stop_price or order.price or 0)
+            if not trigger:
+                raise ConnectionError("STOP order without a trigger price")
+            spec["type"] = "STOP"
+            spec["price"] = self._price_str(trigger)
+            spec["timeInForce"] = "GTC"
+        else:
+            raise ConnectionError(f"Order type {order.order_type} not supported on OANDA")
+
+        data = await self._request(
+            "POST", f"/accounts/{self._account_id()}/orders", body={"order": spec}
+        )
+
+        create = data.get("orderCreateTransaction", {})
+        fill = data.get("orderFillTransaction")
+        cancel = data.get("orderCancelTransaction")
+        broker_order_id = str(create.get("id") or "")
+
+        if fill:
+            return {
+                "broker_order_id": broker_order_id,
+                "status": "FILLED",
+                "avg_price": float(fill.get("price") or 0),
+                "filled_qty": abs(float(fill.get("units") or 0)),
+            }
+        if cancel:
+            # Created then immediately cancelled broker-side (MARKET_HALTED,
+            # INSUFFICIENT_MARGIN, …) — an honest rejection, not a resting order.
+            raise ConnectionError(f"OANDA rejected: {cancel.get('reason') or 'cancelled at broker'}")
+        return {"broker_order_id": broker_order_id, "status": "SUBMITTED", "avg_price": None}
+
+    async def cancel_order(self, broker_order_id: str) -> dict:
+        try:
+            await self._request(
+                "PUT", f"/accounts/{self._account_id()}/orders/{broker_order_id}/cancel"
+            )
+            return {"status": "CANCELLED"}
+        except ConnectionError:
+            return {"status": "CANCEL_FAILED"}
+
+    async def get_order(self, broker_order_id: str) -> dict | None:
+        """Broker-side view of one order in the fill-sync shape:
+        {status, filled_qty, avg_price}. None when OANDA can't answer."""
+        account = self._account_id()
+        try:
+            data = await self._request("GET", f"/accounts/{account}/orders/{broker_order_id}")
+        except ConnectionError:
+            return None
+        o = data.get("order", {})
+        state = str(o.get("state") or "").upper()
+        # v20 states → app vocabulary. TRIGGERED = a stop/limit whose trigger
+        # hit and is now working — still open from the app's point of view.
+        status = {
+            "PENDING": "SUBMITTED",
+            "TRIGGERED": "SUBMITTED",
+            "FILLED": "FILLED",
+            "CANCELLED": "CANCELLED",
+        }.get(state, "UNKNOWN")
+
+        filled_qty = 0.0
+        avg_price = 0.0
+        if status == "FILLED":
+            filled_qty = abs(float(o.get("units") or 0))
+            filling_id = o.get("fillingTransactionID")
+            if filling_id:
+                try:
+                    tx = await self._request(
+                        "GET", f"/accounts/{account}/transactions/{filling_id}"
+                    )
+                    t = tx.get("transaction", {})
+                    avg_price = float(t.get("price") or 0)
+                    filled_qty = abs(float(t.get("units") or filled_qty))
+                except ConnectionError:
+                    pass  # keep qty; sync backs the price out or retries
+        return {"status": status, "filled_qty": filled_qty, "avg_price": avg_price}
+
+    async def get_positions(self) -> list[dict]:
+        data = await self._request("GET", f"/accounts/{self._account_id()}/openPositions")
+        out = []
+        for p in data.get("positions", []):
+            for side_key, side in (("long", "LONG"), ("short", "SHORT")):
+                leg = p.get(side_key) or {}
+                units = float(leg.get("units") or 0)
+                if units:
+                    out.append({
+                        "symbol": p.get("instrument", "").replace("_", "/"),
+                        "qty": abs(units),
+                        "side": side,
+                        "avg_price": float(leg.get("averagePrice") or 0),
+                        "unrealized_pl": float(leg.get("unrealizedPL") or 0),
+                    })
+        return out
+
+    async def get_fills(self, since: datetime | None = None) -> list[dict]:
+        # MARKET fills arrive inline on submit; resting LIMIT/STOP fills are
+        # reconciled by oanda_fill_sync (get_order poll) — nothing consumes a
+        # raw fill list here.
+        return []
+
+
 # ── Paper / Simulation Adapter ────────────────────────────────────────────────
 
 class PaperAdapter(BrokerAdapter):
@@ -358,6 +592,7 @@ ADAPTER_MAP = {
     "BINANCE": CCXTAdapter,
     "CCXT": CCXTAdapter,
     "MT5": MT5Adapter,
+    "OANDA": OandaAdapter,
     "PAPER": PaperAdapter,
 }
 
@@ -365,7 +600,7 @@ ADAPTER_MAP = {
 class UnsupportedBrokerError(Exception):
     """
     Raised when a broker's type has no real adapter implementation (IBKR,
-    OANDA, LMAX, MT5, CUSTOM today) and the broker wasn't explicitly marked
+    LMAX, CUSTOM today) and the broker wasn't explicitly marked
     is_paper=True. Without this, get_adapter() used to silently return
     PaperAdapter for any unmapped type -- a user configuring a real "IBKR"
     connection with is_paper=False would unknowingly get fake instant fills.

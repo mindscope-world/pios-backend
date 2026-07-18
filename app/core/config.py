@@ -95,6 +95,8 @@ class Settings(BaseSettings):
     # The EA also pushes ORDER_UPDATE frames the instant a deal executes;
     # this poll loop is the safety net (see mt5_fill_sync.py)
     MT5_FILL_SYNC_INTERVAL_SECS: int = 15
+    # Poll interval for resting OANDA orders (oanda_fill_sync)
+    OANDA_FILL_SYNC_INTERVAL_SECS: int = 15
 
     # Conditional-order engine (STOP_LIMIT triggers, OCO linked legs): how
     # often pending triggers are evaluated against live prices
