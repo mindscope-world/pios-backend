@@ -4,7 +4,20 @@ import logging
 import signal
 from typing import Any, List
 import orjson
+from fastapi.encoders import jsonable_encoder
 from redis.asyncio import Redis
+
+
+def _dumps(obj) -> bytes:
+    """orjson.dumps with FastAPI's encoder as the unknown-type fallback.
+
+    The compute_* services return API-layer values (ORM rows like Position/
+    EquityPoint, Decimals, datetimes) that FastAPI would encode in a normal
+    response path. Bare orjson raised on them here — and one bad payload
+    (positions/equity_curve once the system user has real trading history)
+    aborted the whole per-symbol persist+publish block, silently killing
+    every pub/sub broadcast below the failing line for every symbol."""
+    return orjson.dumps(obj, default=jsonable_encoder)
 from app.helpers.helpers import get_symbol_by_name
 from app.models.all_models import Symbol, User
 from app.services.intelligence.command_center_service import compute_command_center_current
@@ -64,8 +77,11 @@ def _publishable_payload(payload: Any) -> dict:
 
 
 async def fetch_symbols():
+    # is_active filter: retired/test rows must not burn a live-data fetch
+    # (and an error log) every single cycle — deactivating a symbol row is
+    # how coverage is switched off without deleting order history.
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Symbol.symbol))
+        result = await db.execute(select(Symbol.symbol).where(Symbol.is_active == True))  # noqa: E712
         return [row[0] for row in result.fetchall()]
 
 async def fetch_users():
@@ -305,71 +321,71 @@ async def process_symbol(symbol: str):
             market_ticks = {"error": str(e)}
 
     # ── Persist to Redis (short TTL — these are live snapshots) ──────────
-    await REDIS.set(f"why_not_trade:{key}",  orjson.dumps(why_not_trade),  ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"command_center:{key}", orjson.dumps(command_center), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"scenarios:{key}", orjson.dumps(scenarios), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"decision_feed:{key}", orjson.dumps(decision_feed), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"decision_traces:{key}", orjson.dumps(decision_traces), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"order_flow:{key}", orjson.dumps(order_flow), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"features:{key}", orjson.dumps(features), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"gmig_snapshot:{key}", orjson.dumps(gmig_snapshot), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"gmig_radar:{key}", orjson.dumps(gmig_radar), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"regime_history:{key}", orjson.dumps(regime_history), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"regime_trend:{key}", orjson.dumps(regime_trend), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"alpha_state:{key}", orjson.dumps(alpha_state), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"alpha_darwin:{key}", orjson.dumps(alpha_darwin), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"adaptation_feed:{key}", orjson.dumps(adaptation_feed), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"adaptation_active:{key}", orjson.dumps(adaptation_active), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"adaptation_drift:{key}", orjson.dumps(adaptation_drift), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"behavior_session:{key}", orjson.dumps(behavior_session), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"behavior_trend:{key}", orjson.dumps(behavior_trend), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"behavior_overrides:{key}", orjson.dumps(behavior_overrides), ex=SNAPSHOT_TTL_S)
-    # await REDIS.set(f"risk_metrics:{key}", orjson.dumps(risk_metrics), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"capital_allocation:{key}", orjson.dumps(capital_allocation), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"capital_rebalance:{key}", orjson.dumps(capital_rebalance), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"data_integrity:{key}", orjson.dumps(data_integrity), ex=SNAPSHOT_TTL_S)
-    # await REDIS.set(f"data_quality:{key}", orjson.dumps(data_quality), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"positions:{key}", orjson.dumps(positions), ex=SNAPSHOT_TTL_S)
-    # await REDIS.set(f"portfolio_metrics:{key}", orjson.dumps(portfolio_metrics), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"equity_curve:{key}", orjson.dumps(equity_curve), ex=SNAPSHOT_TTL_S)
-    # await REDIS.set(f"strategies:{key}", orjson.dumps(strategies), ex=SNAPSHOT_TTL_S)
-    # await REDIS.set(f"alerts:{key}", orjson.dumps(alerts), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"trading_view_ticks:{symbol}", orjson.dumps(tv_payload), ex=SNAPSHOT_TTL_S)
-    await REDIS.set(f"market_ticks:{symbol}", orjson.dumps(market_ticks), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"why_not_trade:{key}",  _dumps(why_not_trade),  ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"command_center:{key}", _dumps(command_center), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"scenarios:{key}", _dumps(scenarios), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"decision_feed:{key}", _dumps(decision_feed), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"decision_traces:{key}", _dumps(decision_traces), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"order_flow:{key}", _dumps(order_flow), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"features:{key}", _dumps(features), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"gmig_snapshot:{key}", _dumps(gmig_snapshot), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"gmig_radar:{key}", _dumps(gmig_radar), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"regime_history:{key}", _dumps(regime_history), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"regime_trend:{key}", _dumps(regime_trend), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"alpha_state:{key}", _dumps(alpha_state), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"alpha_darwin:{key}", _dumps(alpha_darwin), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"adaptation_feed:{key}", _dumps(adaptation_feed), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"adaptation_active:{key}", _dumps(adaptation_active), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"adaptation_drift:{key}", _dumps(adaptation_drift), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"behavior_session:{key}", _dumps(behavior_session), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"behavior_trend:{key}", _dumps(behavior_trend), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"behavior_overrides:{key}", _dumps(behavior_overrides), ex=SNAPSHOT_TTL_S)
+    # await REDIS.set(f"risk_metrics:{key}", _dumps(risk_metrics), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"capital_allocation:{key}", _dumps(capital_allocation), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"capital_rebalance:{key}", _dumps(capital_rebalance), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"data_integrity:{key}", _dumps(data_integrity), ex=SNAPSHOT_TTL_S)
+    # await REDIS.set(f"data_quality:{key}", _dumps(data_quality), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"positions:{key}", _dumps(positions), ex=SNAPSHOT_TTL_S)
+    # await REDIS.set(f"portfolio_metrics:{key}", _dumps(portfolio_metrics), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"equity_curve:{key}", _dumps(equity_curve), ex=SNAPSHOT_TTL_S)
+    # await REDIS.set(f"strategies:{key}", _dumps(strategies), ex=SNAPSHOT_TTL_S)
+    # await REDIS.set(f"alerts:{key}", _dumps(alerts), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"trading_view_ticks:{symbol}", _dumps(tv_payload), ex=SNAPSHOT_TTL_S)
+    await REDIS.set(f"market_ticks:{symbol}", _dumps(market_ticks), ex=SNAPSHOT_TTL_S)
 
 
     # ── Pub/sub broadcast ────────────────────────────────────────────────
-    await REDIS.publish("why_not_trade", orjson.dumps({"symbol": key, **_publishable_payload(why_not_trade)}),)
-    await REDIS.publish("command_center", orjson.dumps({"symbol": key, **_publishable_payload(command_center)}),)
-    await REDIS.publish("scenarios", orjson.dumps({"symbol": key, **_publishable_payload(scenarios)}),)
-    await REDIS.publish("decision_feed", orjson.dumps({"symbol": key, **_publishable_payload(decision_feed)}),)
-    await REDIS.publish("decision_traces", orjson.dumps({"symbol": key, **_publishable_payload(decision_traces)}),)
-    await REDIS.publish("order_flow", orjson.dumps({"symbol": key, **_publishable_payload(order_flow)}),)
-    await REDIS.publish("features", orjson.dumps({"symbol": key, **_publishable_payload(features)}),)
-    await REDIS.publish("gmig_snapshot", orjson.dumps({"symbol": key, **_publishable_payload(gmig_snapshot)}),)
-    await REDIS.publish("gmig_radar", orjson.dumps({"symbol": key, **_publishable_payload(gmig_radar)}),)
-    await REDIS.publish("regime_history", orjson.dumps({"symbol": key, **_publishable_payload(regime_history)}),)
-    await REDIS.publish("regime_trend", orjson.dumps({"symbol": key, **_publishable_payload(regime_trend)}),)
-    await REDIS.publish("alpha_state", orjson.dumps({"symbol": key, **_publishable_payload(alpha_state)}),)
-    await REDIS.publish("alpha_darwin", orjson.dumps({"symbol": key, **_publishable_payload(alpha_darwin)}),)
-    await REDIS.publish("adaptation_feed", orjson.dumps({"symbol": key, **_publishable_payload(adaptation_feed)}),)
-    await REDIS.publish("adaptation_active", orjson.dumps({"symbol": key, **_publishable_payload(adaptation_active)}),)
-    await REDIS.publish("adaptation_drift", orjson.dumps({"symbol": key, **_publishable_payload(adaptation_drift)}),)
-    await REDIS.publish("behavior_session", orjson.dumps({"symbol": key, **_publishable_payload(behavior_session)}),)
-    await REDIS.publish("behavior_trend", orjson.dumps({"symbol": key, **_publishable_payload(behavior_trend)}),)
-    await REDIS.publish("behavior_overrides", orjson.dumps({"symbol": key, **_publishable_payload(behavior_overrides)}),)
-    # await REDIS.publish("risk_metrics", orjson.dumps({"symbol": key, **_publishable_payload(risk_metrics)}),)
-    await REDIS.publish("capital_allocation", orjson.dumps({"symbol": key, **_publishable_payload(capital_allocation)}),)
-    await REDIS.publish("capital_rebalance", orjson.dumps({"symbol": key, **_publishable_payload(capital_rebalance)}),)
-    await REDIS.publish("data_integrity", orjson.dumps({"symbol": key, **_publishable_payload(data_integrity)}),)
-    # await REDIS.publish("data_quality", orjson.dumps({"symbol": key, **_publishable_payload(data_quality)}),)
-    await REDIS.publish("positions", orjson.dumps({"symbol": key, **_publishable_payload(positions)}),)
-    # await REDIS.publish("portfolio_metrics", orjson.dumps({"symbol": key, **_publishable_payload(portfolio_metrics)}),)
-    await REDIS.publish("equity_curve", orjson.dumps({"symbol": key, **_publishable_payload(equity_curve)}),)
-    # await REDIS.publish("strategies", orjson.dumps({"symbol": key, **_publishable_payload(strategies)}),)
-    # await REDIS.publish("alerts", orjson.dumps({"symbol": key, **_publishable_payload(alerts)}),)
-    await REDIS.publish("trading_view_ticks", orjson.dumps({"symbol": symbol, **_publishable_payload(tv_payload)}),)
-    await REDIS.publish("market_ticks", orjson.dumps({"symbol": symbol, **_publishable_payload(market_ticks)}),)
+    await REDIS.publish("why_not_trade", _dumps({"symbol": key, **_publishable_payload(why_not_trade)}),)
+    await REDIS.publish("command_center", _dumps({"symbol": key, **_publishable_payload(command_center)}),)
+    await REDIS.publish("scenarios", _dumps({"symbol": key, **_publishable_payload(scenarios)}),)
+    await REDIS.publish("decision_feed", _dumps({"symbol": key, **_publishable_payload(decision_feed)}),)
+    await REDIS.publish("decision_traces", _dumps({"symbol": key, **_publishable_payload(decision_traces)}),)
+    await REDIS.publish("order_flow", _dumps({"symbol": key, **_publishable_payload(order_flow)}),)
+    await REDIS.publish("features", _dumps({"symbol": key, **_publishable_payload(features)}),)
+    await REDIS.publish("gmig_snapshot", _dumps({"symbol": key, **_publishable_payload(gmig_snapshot)}),)
+    await REDIS.publish("gmig_radar", _dumps({"symbol": key, **_publishable_payload(gmig_radar)}),)
+    await REDIS.publish("regime_history", _dumps({"symbol": key, **_publishable_payload(regime_history)}),)
+    await REDIS.publish("regime_trend", _dumps({"symbol": key, **_publishable_payload(regime_trend)}),)
+    await REDIS.publish("alpha_state", _dumps({"symbol": key, **_publishable_payload(alpha_state)}),)
+    await REDIS.publish("alpha_darwin", _dumps({"symbol": key, **_publishable_payload(alpha_darwin)}),)
+    await REDIS.publish("adaptation_feed", _dumps({"symbol": key, **_publishable_payload(adaptation_feed)}),)
+    await REDIS.publish("adaptation_active", _dumps({"symbol": key, **_publishable_payload(adaptation_active)}),)
+    await REDIS.publish("adaptation_drift", _dumps({"symbol": key, **_publishable_payload(adaptation_drift)}),)
+    await REDIS.publish("behavior_session", _dumps({"symbol": key, **_publishable_payload(behavior_session)}),)
+    await REDIS.publish("behavior_trend", _dumps({"symbol": key, **_publishable_payload(behavior_trend)}),)
+    await REDIS.publish("behavior_overrides", _dumps({"symbol": key, **_publishable_payload(behavior_overrides)}),)
+    # await REDIS.publish("risk_metrics", _dumps({"symbol": key, **_publishable_payload(risk_metrics)}),)
+    await REDIS.publish("capital_allocation", _dumps({"symbol": key, **_publishable_payload(capital_allocation)}),)
+    await REDIS.publish("capital_rebalance", _dumps({"symbol": key, **_publishable_payload(capital_rebalance)}),)
+    await REDIS.publish("data_integrity", _dumps({"symbol": key, **_publishable_payload(data_integrity)}),)
+    # await REDIS.publish("data_quality", _dumps({"symbol": key, **_publishable_payload(data_quality)}),)
+    await REDIS.publish("positions", _dumps({"symbol": key, **_publishable_payload(positions)}),)
+    # await REDIS.publish("portfolio_metrics", _dumps({"symbol": key, **_publishable_payload(portfolio_metrics)}),)
+    await REDIS.publish("equity_curve", _dumps({"symbol": key, **_publishable_payload(equity_curve)}),)
+    # await REDIS.publish("strategies", _dumps({"symbol": key, **_publishable_payload(strategies)}),)
+    # await REDIS.publish("alerts", _dumps({"symbol": key, **_publishable_payload(alerts)}),)
+    await REDIS.publish("trading_view_ticks", _dumps({"symbol": symbol, **_publishable_payload(tv_payload)}),)
+    await REDIS.publish("market_ticks", _dumps({"symbol": symbol, **_publishable_payload(market_ticks)}),)
 
     print(
         f"📢  {symbol} | decision={why_not_trade.get('final_decision')} "
@@ -410,10 +426,10 @@ async def process_user(user_id: int, symbol: str):
             return
 
     # ── Persist + broadcast ───────────────────────────────────────────────
-    await REDIS.set(f"command_center:{user_id}:{key}", orjson.dumps(command), ex=2,)
+    await REDIS.set(f"command_center:{user_id}:{key}", _dumps(command), ex=2,)
     await REDIS.publish(
         "command_center",
-        orjson.dumps({"user_id": user_id, "symbol": key, **_publishable_payload(command)}),
+        _dumps({"user_id": user_id, "symbol": key, **_publishable_payload(command)}),
     )
 
 # ─────────────────────────────────────────────

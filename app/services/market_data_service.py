@@ -365,7 +365,9 @@ async def list_alpaca_crypto_symbols() -> list[dict]:
         a.symbol.split("/")[0] for a in assets
         if a.tradable and str(getattr(a.status, "value", a.status)).lower() == "active"
     })
-    result = [{"symbol": f"{b}/USDT", "base": b} for b in bases]
+    # USDT itself is listed as a base (USDT/USD at Alpaca) but the /USDT
+    # quote convention would surface it as the degenerate USDT/USDT pair.
+    result = [{"symbol": f"{b}/USDT", "base": b} for b in bases if b != "USDT"]
     _ttl_set("alpaca_crypto_symbols", result)
     return result
 
