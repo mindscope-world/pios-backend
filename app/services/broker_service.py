@@ -317,7 +317,25 @@ class PaperAdapter(BrokerAdapter):
 
     async def submit_order(self, order: Order) -> dict:
         import uuid as _uuid
-        return {"broker_order_id": str(_uuid.uuid4()), "status": "FILLED", "avg_price": float(order.price or 0)}
+        price = float(order.price or 0)
+        if price <= 0:
+            # MARKET order with no limit price -- fill at the live ticker, never
+            # at 0 (a $0 fill poisons positions, P&L, and TCA downstream).
+            from app.services.market_data_service import get_live_ticker
+            sym = getattr(getattr(order, "symbol", None), "symbol", None)
+            if sym:
+                try:
+                    ticker = await get_live_ticker(sym)
+                    price = float(ticker.get("last") or ticker.get("bid") or ticker.get("ask") or 0)
+                except Exception:
+                    price = 0.0
+            if price <= 0:
+                raise RuntimeError(
+                    f"Paper broker: no live market price available for "
+                    f"{sym or order.symbol_id} -- cannot simulate a market fill "
+                    f"(retry with a limit price)"
+                )
+        return {"broker_order_id": str(_uuid.uuid4()), "status": "FILLED", "avg_price": price}
 
     async def cancel_order(self, broker_order_id: str) -> dict:
         return {"status": "CANCELLED"}

@@ -63,6 +63,7 @@ bool     g_paired        = false;   // HANDSHAKE_ACK received
 datetime g_nextConnectAt = 0;
 datetime g_handshakeSent = 0;
 datetime g_lastPingAt    = 0;
+datetime g_lastRecvAt    = 0;   // watchdog: last time any bytes arrived
 long     g_ordersDone    = 0;
 long     g_ordersFailed  = 0;
 
@@ -132,6 +133,17 @@ void OnTimer()
       WsSendFrame(0x9, none, 0);
       g_lastPingAt = TimeCurrent();
      }
+
+   // Dead-link watchdog: our pings elicit protocol-level pongs, so a healthy
+   // link never goes quiet for long. A half-open socket (backend restart,
+   // tunnel drop behind NAT) keeps SocketIsConnected() true indefinitely --
+   // silence is the only reliable death signal.
+   if(InpWsPingSecs > 0 && g_lastRecvAt > 0 &&
+      TimeCurrent() - g_lastRecvAt > 3 * InpWsPingSecs)
+     {
+      CloseSocket("server unresponsive for " + IntegerToString(3 * InpWsPingSecs) + "s");
+      return;
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -194,6 +206,7 @@ void Connect()
    ArrayResize(g_frag, 0);
    g_paired        = false;
    g_handshakeSent = 0;
+   g_lastRecvAt    = TimeCurrent();
    g_state         = WS_WAIT_HTTP;
 
    if(!SendString(req))
@@ -281,6 +294,7 @@ void PollSocket()
         }
       if(got == 0)
          break;
+      g_lastRecvAt = TimeCurrent();
       int base = ArraySize(g_rx);
       ArrayResize(g_rx, base + got);
       ArrayCopy(g_rx, chunk, base, 0, got);
