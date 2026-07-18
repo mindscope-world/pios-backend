@@ -254,6 +254,10 @@ async def sweep_once(source: str = "fill-sync") -> int:
 
     synced = 0
     for order_id, broker_id in candidates:
+        # Deliberately the LOCAL registry, not ea_connected_anywhere(): every
+        # worker runs this loop, and gating on the local socket makes exactly
+        # one worker (the socket holder) poll each EA — relaying from all of
+        # them would just multiply GET_ORDER traffic at the terminal.
         conn = mt5_registry.get(str(broker_id))
         if conn is None or not conn.is_connected:
             continue

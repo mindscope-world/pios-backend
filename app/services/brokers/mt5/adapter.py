@@ -22,33 +22,110 @@ Three pieces:
                        method delegates to the shared registry for the
                        actual long-lived, EA-initiated connection.
 
-KNOWN DEPLOYMENT CONSTRAINT: mt5_registry is an in-process singleton, not
-backed by Redis like the app's other cross-worker fan-out (see "Redis
-listener" at startup). Dockerfile runs `uvicorn --workers 2` -- an EA
-connecting via /ws/mt5/{broker_id} lands on one worker's registry, and an
-order HTTP request handled by the *other* worker will see "EA not
-connected" even though it genuinely is, just to a sibling process. This
-fails safe (a clear rejection, not a hang or corrupted order) but is not
-correct under >1 worker without either sticky routing on broker_id at the
-LB/ingress layer, or relaying PLACE_ORDER/ORDER_RESULT through Redis
-pub/sub the way the rest of the app already does. Pin MT5 traffic to a
-single worker (or a dedicated process) until that relay exists.
+MULTI-WORKER DEPLOYMENT: the EA's WebSocket lands on exactly one worker
+process, but order HTTP requests round-robin across all of them (Dockerfile
+runs `uvicorn --workers 2`). Cross-worker requests are relayed over Redis,
+mirroring the app's existing pub/sub fan-out:
+
+  presence  -- the socket-holding worker keeps `mt5:ea:{broker_id}` alive
+               (short-TTL key, heartbeat-refreshed) so any worker can tell
+               "connected somewhere" from "genuinely offline".
+  relay     -- that worker also serves `mt5:req:{broker_id}`: other workers
+               publish {payload, reply_channel} there and await the reply on
+               a per-request channel. MT5Adapter._send prefers the local
+               socket (no Redis hop when the request lands on the right
+               worker) and falls back to the relay when presence says the EA
+               is paired to a sibling process.
+
+The fill-sync poll loop (mt5_fill_sync.sweep_once) deliberately still gates
+on the *local* registry, so exactly one worker -- the socket holder -- polls
+each EA; relaying it from every worker would only multiply EA traffic.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
+import uuid as uuid_mod
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+import orjson
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 
+from app.core.redis import get_redis
 from app.models.all_models import Broker, ExecutionResult, Order
 from app.schemas.all_schemas import BrokerTestResult
 
 log = logging.getLogger(__name__)
+
+# ── Cross-worker relay (Redis) ────────────────────────────────────────────────
+
+WORKER_ID = uuid_mod.uuid4().hex[:8]  # per-process, for presence/debugging
+
+_EA_PRESENCE_TTL_SECS = 15   # presence key expiry — a dead worker's claim ages out
+_EA_PRESENCE_BEAT_SECS = 5   # heartbeat refresh interval (must be < TTL)
+_RELAY_REPLY_MARGIN_SECS = 2.0  # extra wait over the EA timeout for the Redis hop
+
+
+def _presence_key(broker_id: str) -> str:
+    return f"mt5:ea:{broker_id}"
+
+
+def _request_channel(broker_id: str) -> str:
+    return f"mt5:req:{broker_id}"
+
+
+async def ea_connected_anywhere(broker_id: str) -> bool:
+    """True when an EA for this broker is paired to this worker or a sibling."""
+    conn = mt5_registry.get(broker_id)
+    if conn is not None and conn.is_connected:
+        return True
+    try:
+        return bool(await get_redis().exists(_presence_key(broker_id)))
+    except Exception:  # Redis down → only local knowledge remains
+        return False
+
+
+async def relay_request(broker_id: str, payload: dict, timeout: float = 10.0) -> dict:
+    """Send one EA request via whichever sibling worker holds the socket.
+
+    Raises the same things MT5Connection.send_request does — TimeoutError
+    when nothing answers in time, ConnectionError when the serving worker
+    reports the EA gone — so callers can't tell local from relayed.
+    """
+    r = get_redis()
+    reply_channel = f"mt5:resp:{uuid_mod.uuid4().hex}"
+    pubsub = r.pubsub()
+    await pubsub.subscribe(reply_channel)
+    try:
+        receivers = await r.publish(
+            _request_channel(broker_id),
+            orjson.dumps({"payload": payload, "reply_channel": reply_channel, "timeout": timeout}),
+        )
+        if receivers == 0:
+            raise ConnectionError(f"MT5 EA disconnected for broker {broker_id}")
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout + _RELAY_REPLY_MARGIN_SECS
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=min(remaining, 1.0))
+            if msg is None or msg.get("type") != "message":
+                continue
+            out = orjson.loads(msg["data"])
+            if out.get("ok"):
+                return out["data"]
+            if out.get("error") == "timeout":
+                raise asyncio.TimeoutError()
+            raise ConnectionError(out.get("error") or "MT5 relay error")
+    finally:
+        with contextlib.suppress(Exception):
+            await pubsub.unsubscribe(reply_channel)
+            await pubsub.aclose()
 
 # Fire-and-forget ORDER_UPDATE handler tasks — referenced here so the event
 # loop can't garbage-collect them mid-flight (same discipline as main.py's
@@ -158,10 +235,15 @@ class MT5Connection:
 
 
 class MT5BridgeRegistry:
-    """Process-wide singleton: broker_id (str) -> MT5Connection."""
+    """Process-wide singleton: broker_id (str) -> MT5Connection.
+
+    Registration also advertises the connection to sibling workers: a
+    presence key in Redis plus a served request channel (see module
+    docstring). Both live exactly as long as the socket."""
 
     def __init__(self):
         self._connections: Dict[str, MT5Connection] = {}
+        self._relay_tasks: Dict[str, asyncio.Task] = {}
 
     def get(self, broker_id: str) -> Optional[MT5Connection]:
         return self._connections.get(broker_id)
@@ -169,15 +251,74 @@ class MT5BridgeRegistry:
     async def register(self, broker_id: str, ws: WebSocket) -> MT5Connection:
         conn = MT5Connection(broker_id, ws)
         self._connections[broker_id] = conn
-        log.info("[MT5:%s] EA connected", broker_id)
+        old = self._relay_tasks.pop(broker_id, None)
+        if old is not None:
+            old.cancel()
+        self._relay_tasks[broker_id] = asyncio.create_task(self._serve_relay(broker_id, conn))
+        log.info("[MT5:%s] EA connected (worker %s)", broker_id, WORKER_ID)
         return conn
 
     def unregister(self, broker_id: str) -> None:
         if self._connections.pop(broker_id, None) is not None:
             log.info("[MT5:%s] EA disconnected", broker_id)
+        task = self._relay_tasks.pop(broker_id, None)
+        if task is not None:
+            task.cancel()
 
     def status(self) -> dict:
         return {bid: conn.is_connected for bid, conn in self._connections.items()}
+
+    async def _serve_relay(self, broker_id: str, conn: MT5Connection) -> None:
+        """Keep the presence key fresh and answer sibling workers' relayed
+        requests for as long as `conn` lives. Cancelled by unregister()."""
+        r = get_redis()
+        pubsub = r.pubsub()
+        try:
+            await pubsub.subscribe(_request_channel(broker_id))
+            last_beat = 0.0
+            while conn.is_connected:
+                now = asyncio.get_event_loop().time()
+                if now - last_beat >= _EA_PRESENCE_BEAT_SECS:
+                    await r.set(_presence_key(broker_id), WORKER_ID, ex=_EA_PRESENCE_TTL_SECS)
+                    last_beat = now
+                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if msg is None or msg.get("type") != "message":
+                    continue
+                try:
+                    req = orjson.loads(msg["data"])
+                except Exception:
+                    continue
+                # Serve concurrently — send_request correlates by id, so
+                # overlapping in-flight requests are fine.
+                task = asyncio.create_task(self._answer_relay(conn, req))
+                _push_tasks.add(task)
+                task.add_done_callback(_push_tasks.discard)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — Redis outage: local path still works
+            log.warning("[MT5:%s] relay serve loop died: %s", broker_id, e)
+        finally:
+            with contextlib.suppress(Exception):
+                await r.delete(_presence_key(broker_id))
+            with contextlib.suppress(Exception):
+                await pubsub.unsubscribe(_request_channel(broker_id))
+                await pubsub.aclose()
+
+    @staticmethod
+    async def _answer_relay(conn: MT5Connection, req: dict) -> None:
+        reply_channel = req.get("reply_channel")
+        payload = req.get("payload") or {}
+        timeout = float(req.get("timeout") or 10.0)
+        try:
+            data = await conn.send_request(payload, timeout=timeout)
+            out: dict = {"ok": True, "data": data}
+        except asyncio.TimeoutError:
+            out = {"ok": False, "error": "timeout"}
+        except Exception as e:  # noqa: BLE001
+            out = {"ok": False, "error": str(e) or "MT5 EA request failed"}
+        if reply_channel:
+            with contextlib.suppress(Exception):
+                await get_redis().publish(reply_channel, orjson.dumps(out))
 
 
 mt5_registry = MT5BridgeRegistry()
@@ -195,41 +336,45 @@ class MT5Adapter:
         self.broker = broker
         self.creds = credentials
 
-    def _connection(self) -> MT5Connection:
-        conn = mt5_registry.get(str(self.broker.id))
-        if conn is None or not conn.is_connected:
-            raise ConnectionError(
-                f"MT5 EA not connected for broker {self.broker.id} -- "
-                f"pair the terminal via /ws/mt5/{self.broker.id} first."
-            )
-        return conn
+    async def _send(self, payload: dict, timeout: float = 10.0) -> dict:
+        """One EA request — local socket when this worker holds it, Redis
+        relay when a sibling does, ConnectionError when nobody does."""
+        broker_id = str(self.broker.id)
+        conn = mt5_registry.get(broker_id)
+        if conn is not None and conn.is_connected:
+            return await conn.send_request(payload, timeout=timeout)
+        if await ea_connected_anywhere(broker_id):
+            return await relay_request(broker_id, payload, timeout=timeout)
+        raise ConnectionError(
+            f"MT5 EA not connected for broker {broker_id} -- "
+            f"pair the terminal via /ws/mt5/{broker_id} first."
+        )
 
     async def test_connection(self) -> BrokerTestResult:
-        conn = mt5_registry.get(str(self.broker.id))
-        if conn is None or not conn.is_connected:
+        if not await ea_connected_anywhere(str(self.broker.id)):
             return BrokerTestResult(success=False, latency_ms=None, message="MT5 EA not connected")
         t0 = time.perf_counter()
         try:
-            await conn.send_request({"type": "PING", "correlation_id": f"ping-{t0}"}, timeout=5.0)
-        except (asyncio.TimeoutError, ConnectionError):
+            await self._send({"type": "PING", "correlation_id": f"ping-{t0}"}, timeout=5.0)
+        except asyncio.TimeoutError:
             pass  # EA may not echo a correlated PONG -- absence isn't fatal, the socket is up
+        except ConnectionError:
+            return BrokerTestResult(success=False, latency_ms=None, message="MT5 EA not connected")
         latency = (time.perf_counter() - t0) * 1000
         return BrokerTestResult(success=True, latency_ms=round(latency, 2), message="EA connected")
 
     async def get_account(self) -> dict:
-        conn = self._connection()
         corr = f"acct-{time.time()}"
         try:
-            return await conn.send_request({"type": "GET_ACCOUNT", "correlation_id": corr})
+            return await self._send({"type": "GET_ACCOUNT", "correlation_id": corr})
         except asyncio.TimeoutError:
             return {}
 
     async def submit_order(self, order: Order) -> dict:
-        conn = self._connection()
         correlation_id = order.client_order_id or str(order.id)
         payload = _order_to_ea_payload(order, correlation_id)
         try:
-            raw = await conn.send_request(payload, timeout=10.0)
+            raw = await self._send(payload, timeout=10.0)
         except asyncio.TimeoutError:
             result = ExecutionResult(success=False, error_message="MT5 response timeout")
         else:
@@ -244,23 +389,21 @@ class MT5Adapter:
         }
 
     async def cancel_order(self, broker_order_id: str) -> dict:
-        conn = self._connection()
         payload = {
             "type":             "CANCEL_ORDER",
             "correlation_id":   f"cancel-{broker_order_id}",
             "broker_order_id":  broker_order_id,
         }
         try:
-            raw = await conn.send_request(payload, timeout=10.0)
+            raw = await self._send(payload, timeout=10.0)
         except asyncio.TimeoutError:
             return {"status": "CANCEL_TIMEOUT"}
         result = _parse_result(raw)
         return {"status": "CANCELLED" if result.success else "CANCEL_FAILED"}
 
     async def get_positions(self) -> list[dict]:
-        conn = self._connection()
         try:
-            result = await conn.send_request({"type": "GET_POSITIONS", "correlation_id": f"pos-{time.time()}"})
+            result = await self._send({"type": "GET_POSITIONS", "correlation_id": f"pos-{time.time()}"})
         except asyncio.TimeoutError:
             return []
         return result.get("positions", [])
@@ -270,14 +413,13 @@ class MT5Adapter:
         {status, filled_qty, avg_price}. Status is app-vocabulary (SUBMITTED/
         PARTIAL/FILLED/CANCELLED/EXPIRED/REJECTED, or UNKNOWN when the EA
         can't place the ticket). None on timeout — the sync loop retries."""
-        conn = self._connection()
         payload = {
             "type":            "GET_ORDER",
             "correlation_id":  f"stat-{broker_order_id}-{time.time()}",
             "broker_order_id": broker_order_id,
         }
         try:
-            raw = await conn.send_request(payload, timeout=10.0)
+            raw = await self._send(payload, timeout=10.0)
         except asyncio.TimeoutError:
             return None
         return {
