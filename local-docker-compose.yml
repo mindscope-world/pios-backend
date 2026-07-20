@@ -64,7 +64,14 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    # -Q is required: every @celery_app.task in backtest_worker.py routes to
+    # "default" or "backtest" (queue="..."), never the implicit "celery"
+    # queue a bare `celery worker` listens to -- without this flag, every
+    # scheduled task (snapshot_pnl, regime_scan, drift_monitor, etc.) queues
+    # forever and is never consumed. Found live: 15k+ backlogged messages
+    # sitting unconsumed in "default" after running this command as
+    # documented, going back further than this session.
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q default,backtest,celery
     env_file: .env
     environment:
       DATABASE_URL_SYNC: ${DATABASE_URL_SYNC}

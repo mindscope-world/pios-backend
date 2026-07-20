@@ -60,7 +60,10 @@ services:
   worker:
     extends:
       service: app
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    # -Q required -- see local-docker-compose.yml's comment on the same
+    # line: every task routes to "default"/"backtest", never the implicit
+    # "celery" queue a bare `celery worker` consumes.
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q default,backtest,celery
 
   # ── Celery beat ───────────────────────────────────────────────────────────
   beat:
