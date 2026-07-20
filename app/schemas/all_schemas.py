@@ -141,6 +141,15 @@ class SymbolOut(BaseModel):
 # ORDERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class ConfirmDecisionRequest(BaseModel):
+    """Semi-auto execution (§3.1) -- deliberately minimal. Everything about
+    the order's terms (side, qty, whether it's even allowed to fire) is
+    re-derived server-side from the live decision at confirm time, not
+    trusted from the client. See order_service.confirm_decision."""
+    symbol: str
+    broker_id: uuid.UUID
+    client_order_id: str | None = Field(None, max_length=100)
+
 class OrderCreate(BaseModel):
     broker_id: uuid.UUID
     client_order_id: str | None = Field(

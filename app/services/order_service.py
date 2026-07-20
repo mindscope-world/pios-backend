@@ -16,8 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.helpers.helpers import get_symbol_by_name
-from app.models.all_models import Order, Fill, Symbol, Broker, RiskLimit, Alert, OrderStatus
-from app.schemas.all_schemas import OrderCreate, TCAReport, _ALGORITHMIC_ORDER_TYPES, _CONDITIONAL_ORDER_TYPES
+from app.models.all_models import Order, Fill, Symbol, Broker, RiskLimit, Alert, OrderStatus, User
+from app.schemas.all_schemas import OrderCreate, ConfirmDecisionRequest, TCAReport, _ALGORITHMIC_ORDER_TYPES, _CONDITIONAL_ORDER_TYPES
 from app.services.broker_service import get_adapter, get_broker_or_404
 from app.services.execution_algo import run_algo_order
 from app.services.audit_service import write_audit
@@ -303,6 +303,98 @@ def start_algo_execution(order_id: uuid.UUID) -> None:
     task = asyncio.create_task(run_algo_order(order_id))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+# ── Semi-auto confirm (§3.1, labeled MVP) ───────────────────────────────────────
+
+async def confirm_decision(
+    db: AsyncSession,
+    data: ConfirmDecisionRequest,
+    user_id: uuid.UUID,
+    user_role: str,
+    user_email: str,
+    ip: str | None = None,
+) -> Order:
+    """
+    Semi-auto execution -- one click submits a real order to a real broker,
+    so nothing about the order's terms is trusted from the client. The
+    caller sends only symbol + broker_id; everything else is re-derived
+    here from the live decision at confirm time (compute_command_center_current,
+    called fresh, not the worker's ~10-15s-stale Redis cache).
+
+    Direction has no dedicated signal anywhere in this codebase --
+    `decision` (ALLOW/BLOCK/WAIT/REDUCE) is a permission gate, not a side.
+    The only directional proxy available is regime (BULL -> long-biased,
+    BEAR -> short-biased -- the same proxy prs_service.REGIME_DIRECTION
+    uses for PRS grading), so semi-auto means "confirm a regime-implied
+    BUY/SELL, gated by ALLOW" -- not "the system decided to buy". Gated
+    strictly on ALLOW (not REDUCE), per explicit sign-off on this framing.
+
+    Restricted to MT5 brokers for now: the suggested size
+    (`final_size_lot`, quant_engine.py's g_size sizing model) is
+    lot-denominated, which is meaningless for any other broker's unit
+    convention (whole units for OANDA, base-asset qty for Alpaca/CCXT) --
+    the same ambiguity the manual ticket hit and fixed by blanking Qty for
+    non-MT5 brokers rather than inventing a conversion. Same call here:
+    reject other broker types with a clear reason instead of guessing.
+    """
+    from app.services.intelligence.command_center_service import compute_command_center_current
+    from app.services.intelligence.prs_service import REGIME_DIRECTION
+
+    broker = await get_broker_or_404(db, data.broker_id, user_id, user_role)
+    if broker.broker_type != "MT5":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Semi-auto confirm is limited to MT5 brokers for now -- the "
+                f"suggested size is lot-denominated and has no defined "
+                f"meaning for {broker.broker_type}'s unit convention."
+            ),
+        )
+
+    user = await db.get(User, user_id)
+    decision = await compute_command_center_current(current_user=user, db=db, symbol=data.symbol)
+    if decision.get("error"):
+        raise HTTPException(status_code=422, detail=f"No live decision available: {decision['error']}")
+
+    decision_label = decision.get("decision")
+    if decision_label != "ALLOW":
+        raise HTTPException(
+            status_code=422,
+            detail=f"Decision is {decision_label}, not ALLOW -- nothing to confirm.",
+        )
+
+    regime_label = (decision.get("regime") or {}).get("label")
+    direction = REGIME_DIRECTION.get(regime_label)
+    if direction is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Regime {regime_label!r} gives no directional bias -- nothing to confirm.",
+        )
+
+    qty = decision.get("final_size_lot")
+    if not qty or qty <= 0:
+        raise HTTPException(status_code=422, detail="No positive suggested size available to confirm.")
+
+    order_data = OrderCreate(
+        broker_id=data.broker_id,
+        client_order_id=data.client_order_id,
+        symbol=data.symbol,
+        side="BUY" if direction == "LONG" else "SELL",
+        order_type="MARKET",
+        qty=float(qty),
+        algo_config={
+            "source": "SEMI_AUTO_CONFIRM",
+            "decision_snapshot": {
+                "decision": decision_label,
+                "confidence": decision.get("confidence"),
+                "regime_label": regime_label,
+                "final_size_lot": qty,
+                "evaluated_at": decision.get("evaluated_at"),
+            },
+        },
+    )
+    return await submit_order(db, order_data, user_id=user_id, user_role=user_role, user_email=user_email, ip=ip)
 
 
 # ── Cancel order ──────────────────────────────────────────────────────────────

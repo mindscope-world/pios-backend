@@ -35,6 +35,7 @@ from app.services.intelligence.montecarlo_service import compute_monte_carlo, co
 from app.services.intelligence.ofi_service import compute_ofi, compute_ofi_chart, compute_ofi_signal_auto
 from app.services.intelligence.signal_conflict_service import compute_signal_conflict, compute_signal_conflict_auto
 from app.services.intelligence import prs_service
+from app.services.intelligence import calibration_service
 from app.services.intelligence.cross_market_service import compute_gmig_enhanced
 from app.services.market_data_service import (
     get_live_ticker, get_ohlcv, get_orderbook, get_recent_trades,
@@ -317,6 +318,22 @@ async def predictor_reliability_score(
     if not sym_row:
         return {"error": "no_market_data"}
     return await prs_service.compute_prs(db, sym_row.id)
+
+
+@router.get("/calibration-digest")
+async def calibration_digest(
+    hours: int = Query(24, ge=1, le=168),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    §3.3 -- the fuller calibration digest (eligible setups vs. skipped,
+    rolling window). See calibration_service.py's module docstring: this
+    reports two honestly independent counts (system-wide QuantDecision
+    setups, your own order activity) rather than fabricating a per-setup
+    taken/skipped join that the data doesn't support.
+    """
+    return await calibration_service.compute_calibration_digest(db, current_user.id, hours=hours)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

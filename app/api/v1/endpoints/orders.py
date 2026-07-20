@@ -9,11 +9,11 @@ from app.core.deps import get_current_user, require_trade_exec
 from app.db.session import get_db
 from app.models.all_models import Order, Fill, User
 from app.schemas.all_schemas import (
-    OrderCreate, OrderOut, FillOut, TCAReport,
+    OrderCreate, ConfirmDecisionRequest, OrderOut, FillOut, TCAReport,
     CancelOrderResponse, PaginatedResponse,
 )
 from app.schemas.all_schemas import _ALGORITHMIC_ORDER_TYPES
-from app.services.order_service import submit_order, cancel_order, get_tca_report, start_algo_execution
+from app.services.order_service import submit_order, confirm_decision, cancel_order, get_tca_report, start_algo_execution
 from app.services.trade_events import publish_order_event, publish_position_event
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -50,6 +50,37 @@ async def create_order(
         start_algo_execution(order.id)
     # Post-commit WS nudges (user-scoped; see trade_events.py). Instant fills
     # changed positions too; algo orders publish per slice from execution_algo.
+    await publish_order_event(
+        current_user.id, order_id=order.id, status=order.status,
+        symbol_name=data.symbol, filled_qty=float(order.filled_qty or 0),
+    )
+    if order.status == "FILLED":
+        await publish_position_event(current_user.id, symbol_name=data.symbol)
+    return await _load_order(db, order.id)
+
+
+@router.post("/confirm-decision", response_model=OrderOut, status_code=201)
+async def confirm_decision_order(
+    data: ConfirmDecisionRequest,
+    request: Request,
+    current_user: User = Depends(require_trade_exec),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Semi-auto execution (§3.1) -- confirms the *current live* decision for
+    `symbol`, not whatever the frontend last rendered. Side/qty/whether
+    it's even allowed to fire are re-derived server-side; see
+    order_service.confirm_decision for exactly what that means and why.
+    """
+    ip = request.client.host if request.client else None
+    order = await confirm_decision(
+        db, data,
+        user_id=current_user.id,
+        user_role=current_user.role,
+        user_email=current_user.email,
+        ip=ip,
+    )
+    await db.commit()
     await publish_order_event(
         current_user.id, order_id=order.id, status=order.status,
         symbol_name=data.symbol, filled_qty=float(order.filled_qty or 0),
