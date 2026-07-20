@@ -4,9 +4,12 @@ V10.4 addendum, D.2 -- ClockWeightBands.
 Clamps per-AlphaClock capital exposure (computed in capital_service.py from
 open positions tagged with a strategy carrying a clock) against
 admin-configured min/max bands (ClockWeightBand rows) for the current
-regime. D.3 (PRS-gated dynamic reallocation) is NOT implemented here -- it
-is blocked on the V10.1 Predictor Reliability Score and the V10.3
-clock-conflict reconciler, neither of which exist in this codebase yet.
+regime.
+
+Also holds detect_clock_conflict(), a labeled MVP of the V10.3
+clock-conflict reconciler -- see that function's docstring for what's
+invented vs derived from D.2's own output. D.3 (PRS-gated dynamic
+reallocation) lives in reallocation_service.py, on top of both.
 """
 from __future__ import annotations
 
@@ -89,3 +92,61 @@ def constrain(
             "clamped": clamped_pct != raw_pct,
         })
     return out
+
+
+def _band_pressure(clock_row: dict) -> str:
+    """BELOW (wants more capital) / ABOVE (wants less) / IN_BAND / UNCONFIGURED."""
+    if clock_row["band_min_pct"] is None or clock_row["band_max_pct"] is None:
+        return "UNCONFIGURED"
+    if clock_row["raw_pct"] < clock_row["band_min_pct"]:
+        return "BELOW"
+    if clock_row["raw_pct"] > clock_row["band_max_pct"]:
+        return "ABOVE"
+    return "IN_BAND"
+
+
+def detect_clock_conflict(clocks: list[dict]) -> dict:
+    """
+    V10.3 clock-conflict reconciler -- labeled MVP.
+
+    The addendum names this control "LONG_MEDIUM_CLOCK_CONFLICT
+    block-and-escalate" with nothing else: no formula, no escalation
+    semantics, no definition of what "conflict" means numerically (same
+    spec vacuum as PRS -- see prs_service.py's docstring). Rather than
+    invent a new signal, this derives conflict from constrain()'s own D.2
+    output: LONG_MACRO and MEDIUM_TREND are in conflict when one clock's
+    exposure sits below its band floor (wants more capital) while the
+    other sits above its band ceiling (wants less) in the same regime --
+    two clocks pulling in opposite directions under the same market
+    conditions.
+
+    "Block-and-escalate" is implemented as: the caller (capital_service)
+    sets clock_bands.conflict.conflict = True in the API response, and
+    writes a deduped Alert for escalation. There's no D.3 executor to
+    literally block yet (see reallocation_service.py for what D.3's MVP
+    actually does with this flag: FREEZE the reallocation-speed
+    recommendation).
+    """
+    by_clock = {c["clock"]: c for c in clocks}
+    long_c = by_clock.get("LONG_MACRO")
+    med_c = by_clock.get("MEDIUM_TREND")
+    if not long_c or not med_c:
+        return {"conflict": False, "type": None, "detail": None}
+
+    long_pressure = _band_pressure(long_c)
+    med_pressure = _band_pressure(med_c)
+
+    if {long_pressure, med_pressure} != {"BELOW", "ABOVE"}:
+        return {"conflict": False, "type": None, "detail": None}
+
+    return {
+        "conflict": True,
+        "type": "LONG_MEDIUM_CLOCK_CONFLICT",
+        "detail": (
+            f"LONG_MACRO {long_pressure.lower()} its band "
+            f"({long_c['raw_pct']}% vs [{long_c['band_min_pct']}, {long_c['band_max_pct']}]) while "
+            f"MEDIUM_TREND {med_pressure.lower()} its band "
+            f"({med_c['raw_pct']}% vs [{med_c['band_min_pct']}, {med_c['band_max_pct']}]) -- "
+            f"opposing pressure in the same regime."
+        ),
+    }

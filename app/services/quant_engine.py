@@ -935,6 +935,113 @@ def compute_cvar_allocation(
     return compute_hrp_allocation(returns_matrix)
 
 
+def compute_risk_parity_allocation(returns_matrix: dict[str, list[float]]) -> dict[str, float]:
+    """
+    Vanilla Risk Parity (Equal Risk Contribution) via scipy SLSQP.
+
+    Unlike HRP (which allocates by recursive bisection over a dendrogram),
+    this directly equalises each asset's contribution to total portfolio
+    variance: minimise sum((risk_contribution_i - 1/N)^2) subject to
+    weights summing to 1, same (0.05, 0.40) per-asset bounds as
+    compute_hrp_allocation/compute_cvar_allocation's fallback paths.
+    """
+    if not returns_matrix or len(returns_matrix) < 2:
+        n = max(len(returns_matrix), 1)
+        return {k: round(1.0 / n, 4) for k in returns_matrix}
+
+    import pandas as pd
+    min_len = min(len(v) for v in returns_matrix.values())
+    if min_len < 10:
+        n = len(returns_matrix)
+        return {k: round(1.0 / n, 4) for k in returns_matrix}
+
+    ret_df = pd.DataFrame({k: v[-min_len:] for k, v in returns_matrix.items()})
+    cov = ret_df.cov().values
+    n = len(returns_matrix)
+
+    def _risk_contributions(w: np.ndarray) -> np.ndarray:
+        port_var = w @ cov @ w
+        marginal = cov @ w
+        return w * marginal / port_var
+
+    def _objective(w: np.ndarray) -> float:
+        target = 1.0 / n
+        return float(np.sum((_risk_contributions(w) - target) ** 2))
+
+    try:
+        result = minimize(
+            _objective,
+            x0=np.ones(n) / n,
+            constraints={"type": "eq", "fun": lambda w: np.sum(w) - 1},
+            bounds=[(0.05, 0.40)] * n,
+            method="SLSQP",
+            options={"maxiter": 500, "ftol": 1e-12},
+        )
+        if result.success:
+            weights = result.x / result.x.sum()
+            return {k: round(float(w), 4) for k, w in zip(returns_matrix.keys(), weights)}
+    except Exception as e:
+        log.warning(f"Risk parity optimisation failed: {e}")
+
+    return compute_hrp_allocation(returns_matrix)
+
+
+def compute_black_litterman_allocation(
+    returns_matrix: dict[str, list[float]],
+    risk_aversion: float = 2.5,
+) -> dict[str, float]:
+    """
+    Black-Litterman allocation -- view-less MVP.
+
+    V10.4's D.1 credits "Black-Litterman already ingests GMIG forward
+    views" -- that describes V10-spec behaviour, not this codebase: GMIG
+    (build_gmig_graph) is a real NetworkX causal graph but feeds no
+    optimiser anywhere. Wiring a GMIG->view mapping is future scope, not
+    invented here. Without views, BL's posterior returns collapse to its
+    equilibrium prior *by construction* (this is a mathematical identity of
+    the BL formula, not an approximation) -- so this computes the
+    market-implied equilibrium prior (pi = risk_aversion * Sigma * w_mkt)
+    directly and skips pypfopt's BlackLittermanModel class (which requires
+    a non-empty Q/P view pair and errors on absolute_views=None).
+
+    There's no real market-cap data for these instruments (crypto/forex
+    pairs), so w_mkt is approximated as equal-weight -- a documented
+    simplification. Net effect: this mode is close to, but not identical
+    to, equal-weight once the (0.05, 0.40) bounds bind; it becomes a real
+    differentiated mode once a genuine view source (e.g. GMIG-derived
+    tilts) is wired in.
+    """
+    if not returns_matrix or len(returns_matrix) < 2:
+        n = max(len(returns_matrix), 1)
+        return {k: round(1.0 / n, 4) for k in returns_matrix}
+    if not PYPFOPT_AVAILABLE:
+        return compute_hrp_allocation(returns_matrix)
+
+    import pandas as pd
+    min_len = min(len(v) for v in returns_matrix.values())
+    if min_len < 10:
+        n = len(returns_matrix)
+        return {k: round(1.0 / n, 4) for k in returns_matrix}
+
+    ret_df = pd.DataFrame({k: v[-min_len:] for k, v in returns_matrix.items()})
+    tickers = list(returns_matrix.keys())
+    n = len(tickers)
+    cov = ret_df.cov()
+
+    w_mkt = pd.Series(1.0 / n, index=tickers)
+    prior = risk_aversion * cov.dot(w_mkt)  # market-implied equilibrium excess returns (pi)
+
+    try:
+        ef = EfficientFrontier(prior, cov, weight_bounds=(0.05, 0.40))
+        ef.max_quadratic_utility(risk_aversion=risk_aversion)
+        weights = ef.clean_weights()
+        return {k: round(float(weights[k]), 4) for k in tickers}
+    except Exception as e:
+        log.warning(f"Black-Litterman optimisation failed: {e}, falling back to HRP")
+
+    return compute_hrp_allocation(returns_matrix)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 6  SIGNAL QUALITY — Multi-timeframe conflict (D3.5)
 # ═══════════════════════════════════════════════════════════════════════════════

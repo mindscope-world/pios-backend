@@ -12,11 +12,27 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.all_models import Position, PnLSnapshot, Symbol, User, MarketTick, KillSwitchEvent, Strategy
+from app.models.all_models import Position, PnLSnapshot, Symbol, User, MarketTick, KillSwitchEvent, Strategy, Alert
 from app.services.intelligence.cross_market_service import compute_gmig_snapshot
-from app.services.quant_engine import compute_hrp_allocation
+from app.services.quant_engine import (
+    compute_hrp_allocation, compute_cvar_allocation,
+    compute_black_litterman_allocation, compute_risk_parity_allocation,
+)
 from app.services.intelligence import clock_bands as clock_bands_service
+from app.services.intelligence import prs_service
+from app.services.intelligence import reallocation_service
 from app.helpers.helpers import primary_symbol, latest_regime
+
+CLOCK_CONFLICT_ALERT_DEDUP_MINUTES = 15  # don't re-alert on every call while a conflict is ongoing
+
+# V10.4 §6.2 Engine 5 -- optimiser mode dispatch, all four sharing the same
+# (returns_matrix) -> {asset: weight} signature.
+OPTIMISER_DISPATCH = {
+    "HRP": compute_hrp_allocation,
+    "CVAR": compute_cvar_allocation,
+    "BLACK_LITTERMAN": compute_black_litterman_allocation,
+    "RISK_PARITY": compute_risk_parity_allocation,
+}
 
 
 async def compute_capital_allocation(
@@ -107,8 +123,31 @@ async def compute_capital_allocation(
             rets = list(np.diff(np.log(np.array(prices) + 1e-10)))
             returns_matrix[base] = rets
 
+    # V10.4 §6.2 Engine 5 -- which optimiser mode to run. There's no
+    # per-strategy optimiser in this codebase (this function computes one
+    # portfolio-wide allocation over asset return series, not per strategy)
+    # and no dedicated account-settings table, so the mode is read off
+    # whichever of the user's strategies most recently declared one via
+    # Strategy.config.optimiser_mode -- the same tagging mechanism as
+    # alpha_clock, repurposed here as an account-wide preference in the
+    # absence of a real settings surface. Defaults to HRP (prior behavior)
+    # when no strategy has ever set it.
+    strat_rows = (await db.execute(
+        select(Strategy)
+        .where(Strategy.created_by == current_user.id)
+        .order_by(Strategy.created_at.desc())
+        .limit(20)
+    )).scalars().all()
+    optimiser_mode = "HRP"
+    for st in strat_rows:
+        m = (st.config or {}).get("optimiser_mode")
+        if m:
+            optimiser_mode = m
+            break
+    optimiser_fn = OPTIMISER_DISPATCH.get(optimiser_mode, compute_hrp_allocation)
+
     if len(returns_matrix) >= 2:
-        hrp_weights = compute_hrp_allocation(returns_matrix)
+        hrp_weights = optimiser_fn(returns_matrix)
         # Scale to deployed capital
         deployed_total = sum(asset_exposure.values()) or 1.0
         total_deployed_pct = deployed_pct
@@ -178,9 +217,46 @@ async def compute_capital_allocation(
         if regime_row:
             regime_label = regime_row.regime_label
     bands = await clock_bands_service.get_active_bands(db)
+    clocks = clock_bands_service.constrain(clock_exposure_pct, regime_label, bands)
+
+    # V10.3 clock-conflict reconciler (labeled MVP -- see
+    # clock_bands.detect_clock_conflict's docstring). Escalates via a
+    # deduped Alert so a live conflict doesn't spam one per call -- this
+    # function runs on every worker cycle for every symbol plus every live
+    # /capital/allocation request.
+    conflict_result = clock_bands_service.detect_clock_conflict(clocks)
+    if conflict_result["conflict"]:
+        dedup_cutoff = datetime.now(timezone.utc) - timedelta(minutes=CLOCK_CONFLICT_ALERT_DEDUP_MINUTES)
+        existing = (await db.execute(
+            select(Alert.id).where(
+                Alert.category == "CLOCK_CONFLICT",
+                Alert.auto_resolved.is_(False),
+                Alert.created_at >= dedup_cutoff,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if existing is None:
+            db.add(Alert(
+                severity="P2", source="V10.4_RECONCILER", category="CLOCK_CONFLICT",
+                title="LONG_MACRO / MEDIUM_TREND clock conflict",
+                message=conflict_result["detail"],
+            ))
+            await db.commit()
+
+    # V10.4 D.3 Dynamic Reallocation Trigger (labeled MVP -- see
+    # reallocation_service.py). PRS is symbol/global-scoped in this
+    # codebase, not per-clock, so this reads one reliability signal for the
+    # primary symbol rather than a per-clock score that doesn't exist.
+    prs_tier = "UNKNOWN"
+    if sym:
+        prs_result = await prs_service.compute_prs(db, sym.id)
+        prs_tier = prs_result["reliability_tier"]
+    reallocation_plan = reallocation_service.plan_reallocation_speed(prs_tier, conflict_result["conflict"])
+
     clock_band_result = {
         "regime": clock_bands_service.V104_REGIME_MAP.get(regime_label) if regime_label else None,
-        "clocks": clock_bands_service.constrain(clock_exposure_pct, regime_label, bands),
+        "clocks": clocks,
+        "conflict": conflict_result,
+        "reallocation_plan": reallocation_plan,
     }
 
     return {
@@ -189,6 +265,7 @@ async def compute_capital_allocation(
         "deployed_pct": deployed_pct,
         "rebalance_needed": rebalance_needed,
         "last_rebalanced_at": last_rebalanced,
+        "optimiser_mode": optimiser_mode,
         "slices": slices,
         "clock_bands": clock_band_result,
     }

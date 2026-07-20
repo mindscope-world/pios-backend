@@ -789,7 +789,44 @@ class RegimeState(Base):
     confidence:    Mapped[float]       = mapped_column(Numeric(6, 4), nullable=False)
     hmm_probs:     Mapped[dict | None] = mapped_column(JSONB)
     detected_by:   Mapped[str]         = mapped_column(String(20), default="HMM")
-    
+
+
+class QuantDecision(Base):
+    """V10.1 -- Predictor Reliability Score (PRS) substrate, labeled MVP.
+
+    No V10.1 spec text exists in this codebase beyond the one-line
+    description in the V10.4 addendum audit ("short-horizon hit rate,
+    relative_drop thresholds") -- there is no formula, horizon, or
+    threshold definition to build against. This table + the grading in
+    prs_service.py is a clearly-labeled placeholder methodology, not a
+    verbatim implementation of an unseen spec: direction is a regime-only
+    proxy (BULL->LONG, BEAR->SHORT, else ungraded) and "hit" means price
+    moved in that direction by more than a noise-floor threshold over
+    horizon_minutes. Replace this table's grading logic wholesale if the
+    real V10.1 spec ever surfaces -- nothing here should be treated as
+    authoritative prediction-quality tracking.
+    """
+    __tablename__ = "quant_decisions"
+
+    id:                Mapped[int]          = mapped_column(primary_key=True, autoincrement=True)
+    time:              Mapped[datetime]     = mapped_column(DateTime(timezone=True), nullable=False, index=True, server_default=func.now())
+    symbol_id:         Mapped[int]          = mapped_column(ForeignKey("symbols.id"), nullable=False, index=True)
+    decision:          Mapped[str]          = mapped_column(String(10), nullable=False)   # ALLOW / BLOCK / WAIT / REDUCE
+    direction:         Mapped[str | None]   = mapped_column(String(10))                   # LONG / SHORT / None (ungraded)
+    confidence:        Mapped[float]        = mapped_column(Numeric(6, 3), nullable=False)
+    regime_label:      Mapped[str]          = mapped_column(String(30), nullable=False)
+    price_at_decision: Mapped[float]        = mapped_column(Numeric(20, 8), nullable=False)
+    horizon_minutes:   Mapped[int]          = mapped_column(Integer, default=30)
+    graded_at:         Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    outcome:           Mapped[str | None]   = mapped_column(String(10))                   # HIT / MISS / None (not yet graded)
+    price_at_grading:  Mapped[float | None] = mapped_column(Numeric(20, 8))
+    created_at:        Mapped[datetime]     = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_quantdecision_symbol_graded", "symbol_id", "graded_at"),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1-minute candles  (high-volume, auto-pruned)
 # ─────────────────────────────────────────────────────────────────────────────

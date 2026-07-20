@@ -18,7 +18,8 @@ def _dumps(obj) -> bytes:
     aborted the whole per-symbol persist+publish block, silently killing
     every pub/sub broadcast below the failing line for every symbol."""
     return orjson.dumps(obj, default=jsonable_encoder)
-from app.helpers.helpers import get_symbol_by_name
+from app.helpers.helpers import get_symbol_by_name, latest_regime
+from app.services.intelligence import prs_service
 from app.models.all_models import Symbol, User
 from app.services.intelligence.command_center_service import compute_command_center_current
 from app.services.intelligence.why_not_trade_service import compute_why_not_trade
@@ -49,6 +50,7 @@ REDIS = Redis.from_url(settings.REDIS_URL, encoding="utf-8", decode_responses=Fa
 SYMBOL_REFRESH_INTERVAL = 10     # seconds
 USER_REFRESH_INTERVAL = 15       # seconds
 LOOP_INTERVAL = 0.1              # main loop delay
+PRS_GRADE_INTERVAL = 60          # seconds -- V10.1 PRS grading pass (labeled MVP, see prs_service.py)
 
 # How long each Redis snapshot stays readable. This must comfortably outlive
 # one full worker cycle (every symbol × ~25 service computations, many with
@@ -145,6 +147,22 @@ async def process_symbol(symbol: str):
         except Exception as e:
             print(f"⚠️  compute_command_center_current failed for {symbol}: {e}")
             command_center = {"error": str(e)}
+
+        # V10.1 PRS substrate (labeled MVP -- see prs_service.py docstring):
+        # record this cycle's decision so it can be graded later against
+        # actual price movement. Never fatal to the rest of the pipeline.
+        try:
+            if not command_center.get("error"):
+                regime_row = await latest_regime(db, sym_row.id)
+                await prs_service.record_decision(
+                    db, sym_row.id,
+                    decision=command_center.get("decision", "WAIT"),
+                    confidence=command_center.get("confidence") or 0.0,
+                    regime_label=regime_row.regime_label if regime_row else "RANGE",
+                    price=command_center.get("live_market", {}).get("price"),
+                )
+        except Exception as e:
+            print(f"⚠️  PRS record_decision failed for {symbol}: {e}")
 
         try:
             scenarios = await compute_scenarios(current_user=system_user, db=db, symbol=symbol)
@@ -464,6 +482,22 @@ class Worker:
                 log.error(f"refresh_users error: {e}")
             await asyncio.sleep(USER_REFRESH_INTERVAL)
 
+    async def grade_prs(self):
+        """V10.1 PRS grading pass (labeled MVP, see prs_service.py) — grades
+        every QuantDecision whose horizon has elapsed, independent of the
+        per-symbol pipeline above."""
+        while self.running:
+            try:
+                async with AsyncSessionLocal() as db:
+                    graded = await prs_service.grade_pending_decisions(db)
+                    if graded:
+                        log.info(f"PRS: graded {graded} decision(s)")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.error(f"grade_prs error: {e}")
+            await asyncio.sleep(PRS_GRADE_INTERVAL)
+
     async def safe_run(self, coro):
         async with self.sem:
             task = asyncio.ensure_future(coro)
@@ -480,6 +514,7 @@ class Worker:
         self._background_tasks = [
             asyncio.create_task(self.refresh_symbols(), name="refresh_symbols"),
             asyncio.create_task(self.refresh_users(),   name="refresh_users"),
+            asyncio.create_task(self.grade_prs(),        name="grade_prs"),
         ]
 
         try:

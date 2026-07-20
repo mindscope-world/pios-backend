@@ -328,6 +328,8 @@ async def compute_create_strategy(
     config = dict(data.config or {})
     if data.alpha_clock is not None:
         config["alpha_clock"] = data.alpha_clock
+    if data.optimiser_mode is not None:
+        config["optimiser_mode"] = data.optimiser_mode
     s = Strategy(
         name=data.name.strip(),
         created_by=creator_id,

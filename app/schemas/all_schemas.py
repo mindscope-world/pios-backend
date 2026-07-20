@@ -290,6 +290,11 @@ class PortfolioMetricsOut(BaseModel):
 
 AlphaClock = Literal["SHORT_FLOW", "MEDIUM_TREND", "LONG_MACRO"]
 
+# Engine 5 optimiser mode (V10.4 §6.2) -- which quant_engine allocator
+# capital_service.compute_capital_allocation dispatches to. Same
+# config-JSONB tagging pattern as alpha_clock (no migration).
+OptimiserMode = Literal["HRP", "CVAR", "BLACK_LITTERMAN", "RISK_PARITY"]
+
 class StrategyCreate(BaseModel):
     name: str
     hypothesis: str | None = None
@@ -301,6 +306,7 @@ class StrategyCreate(BaseModel):
     config: dict = Field(default_factory=dict)
     tags: list[str] | None = None
     alpha_clock: AlphaClock | None = None
+    optimiser_mode: OptimiserMode | None = None
 
 class StrategyUpdate(BaseModel):
     name: str | None = None
@@ -310,6 +316,7 @@ class StrategyUpdate(BaseModel):
     risk_profile: dict | None = None
     tags: list[str] | None = None
     alpha_clock: AlphaClock | None = None
+    optimiser_mode: OptimiserMode | None = None
 
 class StrategyAdvanceRequest(BaseModel):
     notes: str | None = None
@@ -341,6 +348,13 @@ class StrategyOut(BaseModel):
         """V10.4 D.2 -- stored in config.alpha_clock, no dedicated column
         (config is JSONB, so tagging needs no migration)."""
         return self.config.get("alpha_clock") if isinstance(self.config, dict) else None
+
+    @computed_field
+    @property
+    def optimiser_mode(self) -> OptimiserMode | None:
+        """V10.4 §6.2 Engine 5 -- stored in config.optimiser_mode, same
+        pattern as alpha_clock."""
+        return self.config.get("optimiser_mode") if isinstance(self.config, dict) else None
 
 class BacktestJobCreate(BaseModel):
     start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
