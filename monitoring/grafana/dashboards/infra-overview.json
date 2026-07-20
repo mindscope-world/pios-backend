@@ -1,0 +1,83 @@
+{
+  "title": "Pi OS - Infra (Postgres / Redis / Celery)",
+  "uid": "pios-infra-overview",
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Postgres up",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "pg_up" }]
+    },
+    {
+      "id": 2,
+      "title": "Postgres active backends",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "pg_stat_database_numbackends",
+          "legendFormat": "{{datname}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Redis up",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 4 },
+      "targets": [{ "expr": "redis_up" }]
+    },
+    {
+      "id": 4,
+      "title": "Redis connected clients",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 8 },
+      "targets": [{ "expr": "redis_connected_clients" }]
+    },
+    {
+      "id": 5,
+      "title": "Redis memory used (bytes)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [{ "expr": "redis_memory_used_bytes" }]
+    },
+    {
+      "id": 6,
+      "title": "Celery tasks by state (rate/5m)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "sum(rate(celery_task_received_total[5m])) by (name)",
+          "legendFormat": "received: {{name}}"
+        },
+        {
+          "expr": "sum(rate(celery_task_succeeded_total[5m])) by (name)",
+          "legendFormat": "succeeded: {{name}}"
+        },
+        {
+          "expr": "sum(rate(celery_task_failed_total[5m])) by (name)",
+          "legendFormat": "failed: {{name}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Celery queue depth (unconsumed messages)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        {
+          "expr": "celery_queue_length",
+          "legendFormat": "{{queue_name}}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

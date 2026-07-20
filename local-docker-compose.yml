@@ -71,7 +71,10 @@ services:
     # forever and is never consumed. Found live: 15k+ backlogged messages
     # sitting unconsumed in "default" after running this command as
     # documented, going back further than this session.
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q default,backtest,celery
+    # -E enables task events -- required for celery-exporter's task-state
+    # counters (sent/received/succeeded/failed); without it those metrics
+    # stay at zero forever regardless of how many tasks actually run.
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q default,backtest,celery -E
     env_file: .env
     environment:
       DATABASE_URL_SYNC: ${DATABASE_URL_SYNC}
@@ -128,5 +131,75 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ── Monitoring: exporters ─────────────────────────────────────────────────
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${DATABASE_USER}:${DATABASE_PASSWORD:-password}@db:5432/${DATABASE_NAME}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  redis_exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    ports:
+      - "9121:9121"
+    depends_on:
+      - redis
+
+  celery_exporter:
+    image: danihodovic/celery-exporter:latest
+    restart: unless-stopped
+    command: --broker-url=redis://redis:6379/0
+    ports:
+      - "9808:9808"
+    depends_on:
+      - redis
+
+  # ── Monitoring: Prometheus ────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    # host networking: the API/worker/beat run natively on the host (not as
+    # compose services) bound to 127.0.0.1, which a bridge-networked
+    # container cannot reach even via host-gateway. On the host network,
+    # every target -- native app included -- is just localhost:<port>.
+    network_mode: host
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - postgres_exporter
+      - redis_exporter
+      - celery_exporter
+
+  # ── Monitoring: Grafana ───────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.1
+    restart: unless-stopped
+    # host networking to match prometheus (see its comment above) -- once
+    # prometheus left the bridge network, its compose service name stopped
+    # resolving for anything still on the bridge, so this reaches it at
+    # localhost:9090 instead (see datasource.yml).
+    network_mode: host
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning/datasources/local:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
+  prometheus_data:
+  grafana_data:

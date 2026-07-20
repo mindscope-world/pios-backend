@@ -63,7 +63,10 @@ services:
     # -Q required -- see local-docker-compose.yml's comment on the same
     # line: every task routes to "default"/"backtest", never the implicit
     # "celery" queue a bare `celery worker` consumes.
-    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q default,backtest,celery
+    # -E enables task events -- required for celery-exporter's task-state
+    # counters (sent/received/succeeded/failed); without it those metrics
+    # stay at zero forever regardless of how many tasks actually run.
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q default,backtest,celery -E
 
   # ── Celery beat ───────────────────────────────────────────────────────────
   beat:
@@ -99,5 +102,71 @@ services:
   #   ports:
   #     - "9092:9092"
 
+  # ── Monitoring: exporters ─────────────────────────────────────────────────
+  # NOTE: mirrors local-docker-compose.yml's monitoring stack, added and
+  # verified there (targets scraping, Grafana rendering real data). This
+  # copy has NOT been run against this file -- it needs the private
+  # registry image and hasn't been pulled/tested here. Topology differs
+  # from local on purpose: api/worker/beat are containers in this file (not
+  # native host processes), so plain service-name scraping is used instead
+  # of local's network_mode: host + localhost workaround.
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${DATABASE_USER}:${DATABASE_PASSWORD:-password}@db:5432/${DATABASE_NAME}?sslmode=disable"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  redis_exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    restart: unless-stopped
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+    depends_on:
+      - redis
+
+  celery_exporter:
+    image: danihodovic/celery-exporter:latest
+    restart: unless-stopped
+    command: --broker-url=redis://redis:6379/0
+    depends_on:
+      - redis
+
+  # ── Monitoring: Prometheus ────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus/prometheus.prod.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+      - postgres_exporter
+      - redis_exporter
+      - celery_exporter
+
+  # ── Monitoring: Grafana ───────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.1
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning/datasources/prod:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
+  prometheus_data:
+  grafana_data:

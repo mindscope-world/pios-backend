@@ -1,0 +1,29 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Unlike prometheus.yml (local dev, where api/worker/beat run natively on
+# the host), docker-compose.yml runs api/worker/beat/ingestor/intelligence
+# as containers on the same bridge network as this one -- so targets use
+# plain service names, no host-gateway/host-networking needed.
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: pios-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:9000"]
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres_exporter:9187"]
+
+  - job_name: redis
+    static_configs:
+      - targets: ["redis_exporter:9121"]
+
+  - job_name: celery
+    static_configs:
+      - targets: ["celery_exporter:9808"]
