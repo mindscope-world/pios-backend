@@ -12,9 +12,11 @@ from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.all_models import Position, PnLSnapshot, Symbol, User, MarketTick, KillSwitchEvent
+from app.models.all_models import Position, PnLSnapshot, Symbol, User, MarketTick, KillSwitchEvent, Strategy
 from app.services.intelligence.cross_market_service import compute_gmig_snapshot
 from app.services.quant_engine import compute_hrp_allocation
+from app.services.intelligence import clock_bands as clock_bands_service
+from app.helpers.helpers import primary_symbol, latest_regime
 
 
 async def compute_capital_allocation(
@@ -60,6 +62,28 @@ async def compute_capital_allocation(
     deployed = sum(asset_exposure.values())
     cash_pct  = round((cash_balance / total_equity) * 100, 2) if total_equity else 20.0
     deployed_pct = round((deployed / total_equity) * 100, 2) if total_equity else 0.0
+
+    # ── V10.4 D.2 -- per-AlphaClock exposure ──────────────────────────────
+    # Positions only carry a strategy_id (and therefore a clock, via
+    # Strategy.config.alpha_clock) when the order that created them was
+    # placed with a strategy attached -- most positions won't be tagged, and
+    # that's an honest state (see clock_bands.constrain, which reports 0%
+    # rather than hiding an untagged/unconfigured clock).
+    strategy_ids = list({p.strategy_id for p in positions if p.strategy_id})
+    strategy_clock: dict[uuid.UUID, str | None] = {}
+    if strategy_ids:
+        strat_res = await db.execute(select(Strategy).where(Strategy.id.in_(strategy_ids)))
+        for strat in strat_res.scalars().all():
+            strategy_clock[strat.id] = (strat.config or {}).get("alpha_clock")
+
+    clock_exposure_pct: dict[str, float] = {}
+    for p in positions:
+        clock = strategy_clock.get(p.strategy_id) if p.strategy_id else None
+        if not clock:
+            continue
+        exposure = float(p.qty) * float(p.avg_cost)
+        pct = (exposure / total_equity) * 100 if total_equity else 0.0
+        clock_exposure_pct[clock] = clock_exposure_pct.get(clock, 0.0) + pct
 
     # ── HRP target weights via quant_engine ──────────────────────────────
     # Build return series per asset from recent ticks
@@ -144,6 +168,21 @@ async def compute_capital_allocation(
     ks = ks_result.scalar_one_or_none()
     last_rebalanced = ks.created_at.isoformat() if ks else (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
 
+    # V10.4 D.2 -- clamp per-clock exposure against admin-configured bands
+    # for the current regime (reuses the same latest_regime/primary_symbol
+    # helpers regime_service.py already uses -- no new regime detection).
+    regime_label = None
+    sym = await primary_symbol(db)
+    if sym:
+        regime_row = await latest_regime(db, sym.id)
+        if regime_row:
+            regime_label = regime_row.regime_label
+    bands = await clock_bands_service.get_active_bands(db)
+    clock_band_result = {
+        "regime": clock_bands_service.V104_REGIME_MAP.get(regime_label) if regime_label else None,
+        "clocks": clock_bands_service.constrain(clock_exposure_pct, regime_label, bands),
+    }
+
     return {
         "total_equity": round(total_equity, 2),
         "cash_pct": cash_pct,
@@ -151,6 +190,7 @@ async def compute_capital_allocation(
         "rebalance_needed": rebalance_needed,
         "last_rebalanced_at": last_rebalanced,
         "slices": slices,
+        "clock_bands": clock_band_result,
     }
 
 

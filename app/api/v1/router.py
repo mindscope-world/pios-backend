@@ -5,7 +5,7 @@ from app.api.v1.endpoints import (
     positions, strategies, risk,
     alerts, audit, data_quality,
     intelligence, behavior, capital, websocket,
-    mt5_bridge,
+    mt5_bridge, clock_bands,
 )
 from app.api.v1.endpoints.execution_quality import (
     data_router,
@@ -32,6 +32,7 @@ api_router.include_router(data_quality.router)
 api_router.include_router(intelligence.router)   # /intelligence/*
 api_router.include_router(behavior.router)       # /behavior/*
 api_router.include_router(capital.router)        # /capital/*
+api_router.include_router(clock_bands.router)     # /clock-bands/*
 api_router.include_router(data_router)           # /data/integrity/*
 api_router.include_router(tca_router)            # /execution/tca/*
 api_router.include_router(market_ticks_router)   # /market/ticks/{symbol_id}

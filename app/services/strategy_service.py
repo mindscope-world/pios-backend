@@ -325,6 +325,9 @@ async def compute_create_strategy(
     ValueError: if the payload contains fields that map to immutable columns
                 (defensive; normally blocked by schema validation upstream).
     """
+    config = dict(data.config or {})
+    if data.alpha_clock is not None:
+        config["alpha_clock"] = data.alpha_clock
     s = Strategy(
         name=data.name.strip(),
         created_by=creator_id,
@@ -334,7 +337,7 @@ async def compute_create_strategy(
         allowed_symbols=data.allowed_symbols or [],
         allowed_regimes=data.allowed_regimes or [],
         risk_profile=data.risk_profile,
-        config=data.config or {},
+        config=config,
         tags=data.tags or [],
     )
     db.add(s)

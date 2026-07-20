@@ -657,6 +657,23 @@ class RiskLimit(Base):
     updated_at:    Mapped[datetime]     = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class ClockWeightBand(Base):
+    """V10.4 D.2 -- admin-tunable min/max exposure band (% of total equity)
+    per AlphaClock x regime. Read by clock_bands.constrain() to clamp the
+    real-time per-clock exposure computed in capital_service.py."""
+    __tablename__ = "clock_weight_bands"
+
+    id:         Mapped[int]          = mapped_column(primary_key=True, autoincrement=True)
+    clock:      Mapped[str]          = mapped_column(String(20), nullable=False)
+    regime:     Mapped[str]          = mapped_column(String(30), nullable=False)
+    min_pct:    Mapped[float]        = mapped_column(Numeric(6, 3), nullable=False)
+    max_pct:    Mapped[float]        = mapped_column(Numeric(6, 3), nullable=False)
+    is_active:  Mapped[bool]         = mapped_column(Boolean, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime]     = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime]     = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class KillSwitchEvent(Base):
     __tablename__ = "kill_switch_events"
 

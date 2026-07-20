@@ -98,6 +98,7 @@ async def update_strategy(
     if data.hypothesis:   s.hypothesis = data.hypothesis
     if data.description:  s.description = data.description
     if data.config:       s.config = {**s.config, **data.config}
+    if data.alpha_clock is not None: s.config = {**s.config, "alpha_clock": data.alpha_clock}
     if data.risk_profile: s.risk_profile = {**s.risk_profile, **data.risk_profile}
     if data.tags:         s.tags = data.tags
 

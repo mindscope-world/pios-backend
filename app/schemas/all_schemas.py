@@ -2,7 +2,7 @@
 # All request/response schemas in one file for clarity.
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, EmailStr, Field, computed_field, field_validator
 
 
@@ -288,6 +288,8 @@ class PortfolioMetricsOut(BaseModel):
 # STRATEGIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+AlphaClock = Literal["SHORT_FLOW", "MEDIUM_TREND", "LONG_MACRO"]
+
 class StrategyCreate(BaseModel):
     name: str
     hypothesis: str | None = None
@@ -298,6 +300,7 @@ class StrategyCreate(BaseModel):
     risk_profile: dict = Field(default_factory=dict)
     config: dict = Field(default_factory=dict)
     tags: list[str] | None = None
+    alpha_clock: AlphaClock | None = None
 
 class StrategyUpdate(BaseModel):
     name: str | None = None
@@ -306,6 +309,7 @@ class StrategyUpdate(BaseModel):
     config: dict | None = None
     risk_profile: dict | None = None
     tags: list[str] | None = None
+    alpha_clock: AlphaClock | None = None
 
 class StrategyAdvanceRequest(BaseModel):
     notes: str | None = None
@@ -330,6 +334,13 @@ class StrategyOut(BaseModel):
     retired_at: datetime | None
     retirement_reason: str | None
     created_at: datetime
+
+    @computed_field
+    @property
+    def alpha_clock(self) -> AlphaClock | None:
+        """V10.4 D.2 -- stored in config.alpha_clock, no dedicated column
+        (config is JSONB, so tagging needs no migration)."""
+        return self.config.get("alpha_clock") if isinstance(self.config, dict) else None
 
 class BacktestJobCreate(BaseModel):
     start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
@@ -389,6 +400,31 @@ class RiskLimitOut(BaseModel):
     breach_action: str
     is_active: bool
     updated_at: datetime
+
+V104Regime = Literal["LOW_VOL_TREND", "HIGH_VOL_TREND", "RANGE_BOUND", "CRISIS_LIQUIDITY", "MACRO_EVENT"]
+
+
+class ClockWeightBandCreate(BaseModel):
+    clock: AlphaClock
+    regime: V104Regime
+    min_pct: float = Field(ge=0, le=100)
+    max_pct: float = Field(ge=0, le=100)
+
+class ClockWeightBandUpdate(BaseModel):
+    min_pct: float | None = Field(default=None, ge=0, le=100)
+    max_pct: float | None = Field(default=None, ge=0, le=100)
+    is_active: bool | None = None
+
+class ClockWeightBandOut(BaseModel):
+    model_config = {"from_attributes": True}
+    id: int
+    clock: str
+    regime: str
+    min_pct: float
+    max_pct: float
+    is_active: bool
+    updated_at: datetime
+
 
 class RiskMetricsOut(BaseModel):
     var95: float
