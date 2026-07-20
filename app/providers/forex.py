@@ -24,7 +24,16 @@ _OANDA_BATCH_SIZE = 20
 
 
 def _oanda_instrument(symbol: str) -> str:
-    return symbol.replace("/", "_")
+    """DB symbols come in both conventions (EUR/USD slashed, XAUUSD
+    slash-less — setup.md §4) but OANDA instrument codes always need the
+    underscore (EUR_USD). Slash-less input previously passed through
+    unchanged (e.g. "XAUUSD"), which isn't a valid OANDA instrument --
+    OANDA 400s the *entire* batched stream request over one bad code in
+    the comma-joined instruments list, so every forex/metal symbol silently
+    got no live ticks, not just the malformed one."""
+    if "/" in symbol:
+        return symbol.replace("/", "_")
+    return f"{symbol[:3]}_{symbol[3:]}" if len(symbol) >= 6 else symbol
 
 
 def _chunked(iterable, size):
@@ -243,7 +252,15 @@ class ForexProvider(BaseProvider):
         if not instrument:
             return
 
-        symbol    = instrument.replace("_", "/")
+        # Mirror image of _oanda_instrument's bug: this unconditionally
+        # inserted a slash (EUR_USD -> EUR/USD), but self.symbol_map is
+        # keyed by the DB's own symbol string -- for slash-less rows
+        # (XAUUSD) that lookup always missed and every price was silently
+        # dropped (not an error, just a `return`, which is why this went
+        # unnoticed). Try both conventions.
+        slashed   = instrument.replace("_", "/")
+        unslashed = instrument.replace("_", "")
+        symbol    = slashed if slashed in self.symbol_map else unslashed
         symbol_id = self.symbol_map.get(symbol)
         if not symbol_id:
             return
