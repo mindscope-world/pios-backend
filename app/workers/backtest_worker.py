@@ -103,7 +103,14 @@ def run_backtest_task(self, job_id: str):
                     "win_rate": fold_pnl["win_rate"],
                     "total_return_pct": fold_pnl["total_return_pct"],
                     "max_dd": fold_pnl["max_dd"],
-                    "passed": fold_sharpe >= 0.8,
+                    # bool(...): fold_sharpe can be a numpy scalar (test_prices is a
+                    # numpy array upstream in _simulate_fold), and numpy's bool_ --
+                    # unlike numpy.float64, which transparently subclasses float --
+                    # does not subclass Python's bool, so it fails full_report's JSON
+                    # serialization on save (numpy 2.x renamed its __name__ to "bool",
+                    # which is why that failure reads "Object of type bool is not
+                    # JSON serializable" and not "bool_").
+                    "passed": bool(fold_sharpe >= 0.8),
                 })
 
                 pct = int((fold_i + 1) / n_folds * 90)
@@ -169,6 +176,12 @@ def run_backtest_task(self, job_id: str):
             return {"job_id": job_id, "status": "COMPLETE", "sharpe": sharpe}
 
         except Exception as exc:
+            # A failure during the try block's own commit (e.g. a bad JSON
+            # value) leaves this session mid-transaction -- committing again
+            # without rolling back first raises PendingRollbackError, which
+            # would propagate out of this handler and leave the job stuck at
+            # RUNNING forever instead of ever reaching FAILED.
+            db.rollback()
             job.status        = "FAILED"
             job.error_message = str(exc)[:500]
             job.completed_at  = datetime.now(timezone.utc)
