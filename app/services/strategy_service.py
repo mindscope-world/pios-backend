@@ -140,7 +140,20 @@ def _check_gate(strategy: Strategy, to_stage: str) -> tuple[bool, str]:
             return False, "A non-empty hypothesis is required before entering BACKTEST"
 
     if to_stage in ("PAPER", "LIVE_SMALL", "SCALED"):
-        jobs: list[BacktestJob] = strategy.backtest_jobs or []
+        # capital_service.compute_rebalance() also writes rows into this
+        # table (config={"type": "REBALANCE"}) -- it's "the only job-tracking
+        # table available" for a capital rebalance request, and BacktestJob.
+        # strategy_id being NOT NULL means it attaches to whichever strategy
+        # the triggering admin happens to own. Found live (2026-07-21): one
+        # strategy's real, passing backtest was invisible to this gate
+        # because 32,000+ rebalance rows were newer -- max() below picked one
+        # of those as "latest" every time, and its sharpe_ratio is always
+        # None (rebalance never writes it), so the gate failed with a
+        # confusing "OOS Sharpe None" instead of ever reading the real
+        # result. Exclude rebalance rows before picking the latest one.
+        jobs: list[BacktestJob] = [
+            j for j in (strategy.backtest_jobs or []) if (j.config or {}).get("type") != "REBALANCE"
+        ]
         if not jobs:
             return False, "At least one completed backtest is required"
 

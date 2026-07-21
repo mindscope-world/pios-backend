@@ -206,9 +206,21 @@ async def list_backtest_jobs(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # capital_service.compute_rebalance() also writes rows into this same
+    # table (config={"type": "REBALANCE"}) -- "the only job-tracking table
+    # available", per that function's own docstring -- since BacktestJob.
+    # strategy_id is NOT NULL, it attaches to whichever strategy the
+    # triggering admin happens to own. Found live (2026-07-21): a strategy
+    # with exactly 3 real backtests had 32,000+ rebalance rows attached the
+    # same way, drowning the real results and picking a rebalance row as
+    # "most recent" for _check_gate's PAPER-gate check too (strategy_service.
+    # py) -- exclude them here with the identical predicate used there.
     result = await db.execute(
         select(BacktestJob)
-        .where(BacktestJob.strategy_id == strategy_id)
+        .where(
+            BacktestJob.strategy_id == strategy_id,
+            BacktestJob.config["type"].as_string().is_distinct_from("REBALANCE"),
+        )
         .order_by(BacktestJob.created_at.desc())
     )
     return result.scalars().all()
