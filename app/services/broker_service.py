@@ -480,11 +480,26 @@ class OandaAdapter(BrokerAdapter):
 
     async def get_order(self, broker_order_id: str) -> dict | None:
         """Broker-side view of one order in the fill-sync shape:
-        {status, filled_qty, avg_price}. None when OANDA can't answer."""
+        {status, filled_qty, avg_price}. None when OANDA can't answer.
+
+        GET /orders/{id} only ever returns an order still in the pending
+        book (state PENDING/TRIGGERED) -- confirmed live (2026-07-21): once
+        an order fills or is cancelled broker-side, this endpoint returns
+        "The order ID specified does not exist" forever after, which this
+        method used to treat as an unconditional None -- meaning a resting
+        order's fill or a broker-side cancel could never be detected by
+        oanda_fill_sync's poll, no matter how many passes ran. Confirmed via
+        three real orders on the practice account: this endpoint answered
+        correctly while genuinely pending, then 100% consistently "doesn't
+        exist" the moment each one left that state (2 fills, 1 cancel, same
+        error every time) -- not a flaky/occasional failure.
+        """
         account = self._account_id()
         try:
             data = await self._request("GET", f"/accounts/{account}/orders/{broker_order_id}")
-        except ConnectionError:
+        except ConnectionError as e:
+            if "does not exist" in str(e).lower():
+                return await self._get_order_terminal_state(account, broker_order_id)
             return None
         o = data.get("order", {})
         state = str(o.get("state") or "").upper()
@@ -513,6 +528,41 @@ class OandaAdapter(BrokerAdapter):
                 except ConnectionError:
                     pass  # keep qty; sync backs the price out or retries
         return {"status": status, "filled_qty": filled_qty, "avg_price": avg_price}
+
+    async def _get_order_terminal_state(self, account: str, broker_order_id: str) -> dict | None:
+        """Looks up a no-longer-pending order's outcome via the transactions
+        feed instead of the (empty, for terminal orders) single-order
+        endpoint. An order's own broker_order_id IS its creation
+        transaction's ID (see submit_order), and v20 transaction IDs are
+        strictly increasing, so any ORDER_FILL/ORDER_CANCEL for this order
+        is guaranteed to have a higher ID -- sinceid=broker_order_id is an
+        exact, correct lower bound, not a heuristic. Verified live against
+        three real orders (2 fills, 1 cancel): each showed up as the very
+        next transaction after its own creation, orderID-matched correctly.
+        """
+        try:
+            data = await self._request(
+                "GET", f"/accounts/{account}/transactions/sinceid?id={broker_order_id}"
+            )
+        except ConnectionError:
+            return None
+        for tx in data.get("transactions", []):
+            if str(tx.get("orderID") or "") != str(broker_order_id):
+                continue
+            tx_type = tx.get("type")
+            if tx_type == "ORDER_FILL":
+                return {
+                    "status": "FILLED",
+                    "filled_qty": abs(float(tx.get("units") or 0)),
+                    "avg_price": float(tx.get("price") or 0),
+                }
+            if tx_type == "ORDER_CANCEL":
+                return {"status": "CANCELLED", "filled_qty": 0.0, "avg_price": 0.0}
+        # Not resolved in this window yet (e.g. OANDA hasn't recorded the
+        # terminal transaction the instant "does not exist" starts firing) --
+        # None, same as any other "couldn't determine state" case; retried
+        # next pass.
+        return None
 
     async def get_positions(self) -> list[dict]:
         data = await self._request("GET", f"/accounts/{self._account_id()}/openPositions")
