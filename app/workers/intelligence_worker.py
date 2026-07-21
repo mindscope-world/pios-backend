@@ -33,7 +33,7 @@ from app.services.alpha_service import compute_alpha_darwin, compute_alpha_facto
 from app.services.intelligence.adaptation_service import compute_adaptation_feed, compute_adaptation_active, compute_adaptation_drift
 from app.services.intelligence.behavior_service import compute_behavior_session, compute_behavior_trend, compute_behavior_overrides
 from app.services.risk_service import compute_risk_metrics
-from app.services.intelligence.capital_service import compute_capital_allocation, compute_rebalance
+from app.services.intelligence.capital_service import compute_capital_allocation
 from app.services.execution_service import compute_data_integrity_status
 from app.services.data_quality_service import compute_data_quality_summary
 from app.services.positions_service import compute_positions, compute_portfolio_metrics, compute_equity_curve
@@ -278,12 +278,23 @@ async def process_symbol(symbol: str):
             print(f"⚠️ Capital Allocation failed for {symbol}: {e}")
             capital_allocation = {"error": str(e)}
         
-        try:
-            capital_rebalance = await compute_rebalance(admin=system_user, db=db)
-        except Exception as e:
-            print(f"⚠️ Capital Rebalance failed for {symbol}: {e}")
-            capital_rebalance = {"error": str(e)}
-        
+        # DISABLED (2026-07-21) -- unlike every other function in this loop,
+        # compute_rebalance() is not a read-only snapshot: every call creates
+        # a real BacktestJob row (config={"type": "REBALANCE"}), dispatches a
+        # real Celery task, and writes a real "REBALANCE_TRIGGERED" audit_log
+        # row. Calling it once per symbol per worker cycle (this loop runs
+        # over the full symbol universe every SNAPSHOT_TTL_S-ish) had been
+        # spamming backtest_jobs (33,000+ rows found live, all attached to
+        # whichever strategy the system user happens to own -- see
+        # strategy_service._check_gate's comment) and audit_log with fake
+        # triggered-rebalance entries for as long as this worker has run.
+        # Nothing consumes the capital_rebalance:{key} cache key or pubsub
+        # channel below (checked repo-wide) -- this call served no purpose
+        # other than its side effects. Do not re-enable without first making
+        # compute_rebalance side-effect-free for a read-only caller, or
+        # giving this loop a real interval/dedup guard.
+        capital_rebalance = {"disabled": "see 2026-07-21 comment in this file"}
+
         try:
             data_integrity = await compute_data_integrity_status(db=db)
         except Exception as e:
