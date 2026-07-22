@@ -253,9 +253,16 @@ async def compute_portfolio_metrics(
         total_equity=round(total_equity, 2),
         equity_change=round(equity_change, 2),
         equity_change_pct=round(equity_change_pct, 4),
-        realized_pnl=round(realized_pnl, 2),
-        realized_today=round(snap.realized_pnl - (yesterday.realized_pnl if yesterday else 0), 2) if snap else 0,
-        unrealized_pnl=round(unrealized_pnl, 2),
+        # Not rounded to cents here (unlike total_equity/max_drawdown above):
+        # a real P&L can legitimately be sub-cent (near-breakeven position,
+        # dust-sized qty -- see position_marks.py), and rounding it away
+        # server-side makes it indistinguishable from a stuck/broken $0.
+        # The frontend's formatMoney() does the display-time rounding and
+        # falls back to more precision only when a value would otherwise
+        # disappear to "0.00".
+        realized_pnl=realized_pnl,
+        realized_today=(snap.realized_pnl - (yesterday.realized_pnl if yesterday else 0)) if snap else 0,
+        unrealized_pnl=unrealized_pnl,
         active_strategies=active_strategies,
         max_drawdown=round(max_dd, 4),
         drawdown_limit=drawdown_limit_value,
