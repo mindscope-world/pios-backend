@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     DEFAULT_MAX_POSITION_USD: float = 20000.0
     DEFAULT_MAX_LEVERAGE: float = 3.0
     DEFAULT_MAX_OPEN_ORDERS: int = 50
+    # Hard cap on AUTO-sourced orders per user per day, account-wide (not
+    # per-symbol) -- see auto_execution_service._check_auto_circuit_breakers.
+    DEFAULT_MAX_AUTO_ORDERS_PER_DAY: int = 20
 
     # Paper-trading equity baseline for per-trader PnL snapshots and the
     # portfolio-metrics fallback when a user has no snapshots yet.
@@ -104,6 +107,9 @@ class Settings(BaseSettings):
     # Mark-to-market job: how often open positions are revalued against live
     # prices so unrealized P&L doesn't go stale between fills
     MARK_TO_MARKET_INTERVAL_SECS: int = 60
+    # Autonomous execution engine: how often each armed (user, symbol) pair
+    # is re-evaluated against a fresh command-center decision.
+    AUTO_EXECUTION_POLL_SECS: int = 60
 
     # OANDA market data fallback for forex ticks and candles
     OANDA_API_KEY:      str = ""
@@ -126,6 +132,20 @@ class Settings(BaseSettings):
     DQ_DEDUP_WINDOW_SECS: int = 10
     DQ_BATCH_SIZE: int = 25
     DQ_PRICE_WINDOW: int = 20
+
+    # Timestamp Corrector (Guide Ch.7): a tick's own claimed time vs. this
+    # server's clock at receipt. Small drift is corrected + logged, not
+    # rejected — a missing timestamp is a Tick Validator hard-reject instead
+    # (see dq_pipeline.py).
+    DQ_TIMESTAMP_DRIFT_MS: int = 2000
+
+    # Continuity Monitor (Guide Ch.7): per-symbol tick-flow watchdog run by
+    # continuity_monitor.py. A symbol with no tick for longer than the gap
+    # threshold is flagged, alerted, and — via command_center_service's
+    # feed_stale check into build_quant_core_gates — blocked from new trade
+    # decisions until the feed resumes.
+    CONTINUITY_CHECK_INTERVAL_SECS: int = 30
+    CONTINUITY_GAP_THRESHOLD_SECS: int = 120
 
     
      # ── Retention (days) ──────────────────────────────────────

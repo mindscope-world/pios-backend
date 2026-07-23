@@ -58,10 +58,41 @@ async def flush_candles(candles: list[dict]) -> None:
         log.error(f"flush_candles error: {e}", exc_info=True)
 
 
+def _dq_module_for_flags(flags: list[str]) -> str:
+    """
+    Which DQ check actually fired, for DQEvent.module. dq_pipeline.check()
+    returns one flag list per tick that can only ever contain flags from a
+    single check today (each check that flags returns immediately, except
+    the timestamp corrector which falls through to the spike/volume checks
+    below it) — priority order here matches evaluation order in
+    dq_pipeline.py, so the earliest-evaluated check that produced a flag is
+    reported as the module, which is always the correct (and in today's
+    pipeline, the only) one.
+    """
+    for flag in flags:
+        if flag in ("ZERO_PRICE", "NEGATIVE_VOLUME", "MISSING_TIMESTAMP"):
+            return "TICK_VALIDATOR"
+        if flag == "DUPLICATE":
+            return "DUPLICATE_FILTER"
+        if flag.startswith("TIMESTAMP_CORRECTED"):
+            return "TIMESTAMP_CORRECTOR"
+        if flag.startswith("SPIKE_") or flag.startswith("VOL_OUTLIER_"):
+            return "OUTLIER_DETECTOR"
+    return "TICK_VALIDATOR"  # defensive default — shouldn't be reached with a non-empty flag list
+
+
 async def flush_dq_events(events: list[dict]) -> None:
     """
     Persist DQ FLAG/REJECT events.
     Called from the main writer loop whenever dq_result != PASS.
+
+    module is derived from which check actually produced the flag (see
+    _dq_module_for_flags) rather than a hardcoded "TICK_VALIDATOR" — before
+    this fix, every flagged/rejected tick was recorded under TICK_VALIDATOR
+    regardless of whether a duplicate filter, spike detector, or volume
+    outlier check was the one that actually fired, which silently zeroed
+    out the per-module pass/flag/reject rates the DQ dashboard reports for
+    every module except TICK_VALIDATOR.
     """
     if not events:
         return
@@ -72,7 +103,7 @@ async def flush_dq_events(events: list[dict]) -> None:
                     time        = _parse_time(e.get("time")),
                     symbol_id   = e.get("symbol_id"),
                     event_type  = e["dq_result"],
-                    module      = "TICK_VALIDATOR",
+                    module      = _dq_module_for_flags(e.get("flags", [])),
                     severity    = "WARN" if e["dq_result"] == "FLAG" else "ERROR",
                     reason      = ", ".join(e.get("flags", [])),
                     raw_payload = {

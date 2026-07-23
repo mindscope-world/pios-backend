@@ -18,7 +18,7 @@ from app.db.session import Base
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 RoleEnum         = SAEnum("admin","trader","quant","viewer","compliance",            name="user_role")
-BrokerTypeEnum   = SAEnum("MT5","ALPACA","BINANCE","IBKR","CCXT","OANDA","LMAX","CUSTOM", name="broker_type")
+BrokerTypeEnum   = SAEnum("MT5","ALPACA","BINANCE","IBKR","CCXT","OANDA","LMAX","CUSTOM","TRADOVATE", name="broker_type")
 BrokerStatusEnum = SAEnum("CONNECTED","DISCONNECTED","ERROR","PENDING_AUTH",         name="broker_status")
 AssetClassEnum   = AssetClassEnum = SAEnum("crypto", "equities", "forex", "futures", "options", "commodity", "bond", "metal", "index", name="asset_class")
 OrderStatusEnum  = SAEnum("NEW","SUBMITTED","PARTIAL","FILLED","CANCELLED","REJECTED","EXPIRED", name="order_status")
@@ -104,14 +104,15 @@ class InvalidTransitionError(Exception):
 
 class BrokerType:
     MT5  = "MT5"
-    IBKR = "IBKR" 
+    IBKR = "IBKR"
     ALPACA = "ALPACA"
     OANDA  = "OANDA"
     CCXT = "CCXT"
     LMAX = "LMAX"
     CUSTOM = "CUSTOM"
     BINANCE = "BINANCE"
-    ALL  = [MT5, IBKR, ALPACA, OANDA, CCXT, LMAX, CUSTOM, BINANCE]
+    TRADOVATE = "TRADOVATE"
+    ALL  = [MT5, IBKR, ALPACA, OANDA, CCXT, LMAX, CUSTOM, BINANCE, TRADOVATE]
 
 
 def _now() -> datetime:

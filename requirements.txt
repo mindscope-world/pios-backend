@@ -135,6 +135,16 @@ mypy_extensions==1.1.0
 networkx==3.6.1
 nltk==3.9.4
 numba==0.65.0
+# IBKR TWS/Gateway client (IBKRAdapter, broker_service.py) — scaffolded,
+# not live-verified (no funded/paper IBKR account or running TWS/Gateway
+# instance in this environment; see Final_development.md §1)
+ib_async==2.1.0
+aeventkit==2.1.0
+nest_asyncio==1.6.0
+# Pure-Python FIX 4.4 message construction/parsing (LMAXAdapter,
+# broker_service.py) — scaffolded, not live-verified (LMAX FIX access is
+# institutional-only, no public sandbox exists)
+simplefix==1.0.17
 numpy==2.4.4
 numpyro==0.20.1
 nvidia-cublas==13.1.0.3

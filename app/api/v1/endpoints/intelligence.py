@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_current_user
 from app.core.redis import get_intelligence_key
 from app.db.session import get_db
-from app.helpers.helpers import get_symbol_by_name, latest_regime, open_positions, primary_symbol, recent_ticks, safe_ms
+from app.helpers.helpers import get_symbol_by_name, is_feed_stale, latest_regime, open_positions, primary_symbol, recent_ticks, safe_ms
 from app.models.all_models import (
     MarketTick, Symbol, RegimeState, Position, Order,
     Strategy, BacktestJob, Fill, PnLSnapshot, Alert, User,
@@ -394,6 +394,7 @@ async def quant_core_gates(
         prices, volumes, sides,
         regime_override=regime.regime_label if regime else None,
         positions_exposure=exposure,
+        feed_stale=is_feed_stale(ticks),
     )
 
     # Reshape for frontend gate card format

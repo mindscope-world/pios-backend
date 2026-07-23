@@ -7,6 +7,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 
+from app.core.config import settings
 from app.models.all_models import MarketTick, Position, RegimeState, Symbol
 
 
@@ -16,6 +17,22 @@ def safe_ms(ts: datetime) -> float:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return (now - ts).total_seconds() * 1000
+
+
+def is_feed_stale(ticks: list) -> bool:
+    """
+    Continuity Monitor's gating condition (Guide Ch.7) — shared by every
+    caller of build_quant_core_gates so "pause dependent strategies on a
+    feed gap" is enforced consistently wherever a decision is computed
+    (the intelligence worker's cache, confirm_decision's fresh re-derive,
+    and the standalone quant-core/gates endpoint), not just wherever someone
+    remembered to check it. No ticks at all, or the most recent one older
+    than CONTINUITY_GAP_THRESHOLD_SECS, counts as stale — mirrors
+    continuity_monitor.py's own alerting condition exactly.
+    """
+    if not ticks:
+        return True
+    return safe_ms(ticks[-1].time) / 1000 > settings.CONTINUITY_GAP_THRESHOLD_SECS
 
 def sharpe(returns: list[float]) -> float:
     if len(returns) < 2:

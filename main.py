@@ -65,13 +65,19 @@ async def lifespan(app: FastAPI):
     from app.services.position_marks import run_position_marks
     app.state.position_marks = asyncio.create_task(run_position_marks())
 
+    # Continuity Monitor — Guide Ch.7's fifth DQ check: per-symbol tick-flow
+    # watchdog, alerts on a genuine feed gap and clears on recovery; see
+    # continuity_monitor.py for how "pauses dependent strategies" is enforced.
+    from app.services.continuity_monitor import run_continuity_monitor
+    app.state.continuity_monitor = asyncio.create_task(run_continuity_monitor())
+
     logger.info("Pi OS API ready")
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     for task_name in ("redis_listener", "alpaca_fill_sync", "alpaca_trade_stream",
                       "mt5_fill_sync", "oanda_fill_sync", "conditional_orders",
-                      "position_marks"):
+                      "position_marks", "continuity_monitor"):
         task = getattr(app.state, task_name, None)
         if task is not None:
             task.cancel()

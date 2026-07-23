@@ -37,6 +37,7 @@ from app.services.quant_engine import (
 from app.services.intelligence.behavior_service import compute_behavior_session
 from app.helpers.helpers import (
     get_symbol_by_name,
+    is_feed_stale,
     latest_regime,
     open_positions,
     primary_symbol,
@@ -144,6 +145,7 @@ async def compute_decision_current(
             sides,
             regime_override=regime.regime_label if regime else None,
             positions_exposure=exposure_pct,
+            feed_stale=is_feed_stale(ticks),
         )
 
         # ── Signal conflicts ──────────────────────────────────────────────────

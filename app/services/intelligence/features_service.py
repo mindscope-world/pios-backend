@@ -42,6 +42,40 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+# ── Feature versioning (Guide Ch.9) ───────────────────────────────────────────
+# Every feature this service computes is tagged with its own version string,
+# bumped only when that specific feature's calculation actually changes
+# (formula, window length, normalization). A consumer that cached or trained
+# against an older version can compare tags and know it's looking at a
+# differently-computed value, rather than silently trusting a number that
+# looks the same shape but isn't the same calculation — the guide's stated
+# purpose for feature versioning.
+#
+# Honest scope note: this is the versioning *mechanism*, not full online/
+# offline parity. There is still no separate offline/training pipeline
+# anywhere in this codebase that reads features by version for model
+# training — every consumer today is this same live path (the intelligence
+# worker's cache, and this endpoint). Versioning something with only one
+# real consumer has a real purpose (a *future* consumer knows immediately
+# when a feature it depends on has changed shape), but it does not by
+# itself close the "online/offline parity" gap the guide describes.
+FEATURE_SET_VERSION = "v1"
+FEATURE_VERSIONS: dict[str, str] = {
+    "Order Flow Imbalance":   "v1",
+    "Buy/Sell Volume Ratio":  "v1",
+    "Volume-Weighted Price":  "v1",
+    "Tick Momentum 5":        "v1",
+    "Tick Momentum 20":       "v1",
+    "Rolling Volatility 20":  "v1",
+    "Rolling Volatility 60":  "v1",
+    "Regime Confidence":      "v1",
+    "Regime Label Encoding":  "v1",
+    "Open Positions Count":   "v1",
+    "Total Exposure USD":     "v1",
+    "Net Unrealized PnL":     "v1",
+}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # compute_features
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,14 +120,15 @@ async def compute_features(
             nonlocal fid
             fid += 1
             return {
-                "id":         f"F{fid:03d}",
-                "name":       name,
-                "category":   cat,
-                "value":      round(_safe_float(value), 6),
-                "unit":       unit,
-                "importance": round(importance, 4),
-                "drift_pct":  round(drift_pct, 2),
-                "updated_at": now_str,
+                "id":              f"F{fid:03d}",
+                "name":            name,
+                "category":        cat,
+                "value":           round(_safe_float(value), 6),
+                "unit":            unit,
+                "importance":      round(importance, 4),
+                "drift_pct":       round(drift_pct, 2),
+                "updated_at":      now_str,
+                "feature_version": FEATURE_VERSIONS.get(name, "v1"),
             }
 
         # ── DB data — non-fatal individually ─────────────────────────────────
@@ -227,27 +262,29 @@ async def compute_features(
                 pass
 
         return {
-            "features":       filtered,
-            "count":          len(filtered),
-            "primary_symbol": primary.symbol if primary else None,
-            "live_price":     live_price,
-            "market_bias":    live_bias,
-            "categories":     all_categories,           # always full, unfiltered
-            "top_features":   top_features,             # always full, unfiltered
+            "features":            filtered,
+            "count":               len(filtered),
+            "primary_symbol":      primary.symbol if primary else None,
+            "live_price":          live_price,
+            "market_bias":         live_bias,
+            "categories":          all_categories,           # always full, unfiltered
+            "top_features":        top_features,             # always full, unfiltered
+            "feature_set_version": FEATURE_SET_VERSION,
             "category_filter": category,
             "fetched_at":     _now_iso(),
         }
 
     except Exception as exc:  # noqa: BLE001
         return {
-            "error":          str(exc),
-            "features":       [],
-            "count":          0,
-            "primary_symbol": None,
-            "live_price":     None,
-            "market_bias":    None,
-            "categories":     [],
-            "top_features":   [],
+            "error":               str(exc),
+            "features":            [],
+            "count":               0,
+            "primary_symbol":      None,
+            "live_price":          None,
+            "market_bias":         None,
+            "categories":          [],
+            "top_features":        [],
+            "feature_set_version": FEATURE_SET_VERSION,
             "category_filter": category,
             "fetched_at":     _now_iso(),
         }

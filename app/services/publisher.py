@@ -35,7 +35,16 @@ class Publisher:
                     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
                     compression_type="gzip",
                     linger_ms=5,        # micro-batch for throughput
-                    acks="1",           # leader ack — balances latency/durability
+                    # Leader-only ack (balances latency/durability). Must be
+                    # the int 1, not the string "1" — this aiokafka version
+                    # only accepts (0, 1, -1, "all"); "1" raised
+                    # ValueError("Invalid ACKS parameter") on every producer
+                    # construction attempt, silently caught by the except
+                    # Exception below and logged as "Kafka producer init
+                    # failed" — meaning this path had never actually
+                    # produced a single message. Found live while verifying
+                    # the Kafka path end-to-end, not from a code read alone.
+                    acks=1,
                 )
                 await _kafka_producer.start()
                 log.info("Kafka producer started")

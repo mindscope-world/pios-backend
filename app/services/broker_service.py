@@ -588,6 +588,654 @@ class OandaAdapter(BrokerAdapter):
         return []
 
 
+# ── IBKR Adapter ──────────────────────────────────────────────────────────────
+
+class IBKRAdapter(BrokerAdapter):
+    """
+    Interactive Brokers execution via the TWS/IB Gateway API (`ib_async`).
+
+    SCAFFOLDED, NOT LIVE-VERIFIED: no funded/paper IBKR account or a running
+    TWS/IB Gateway instance exists in this environment (an access gap, not a
+    code gap — see final_implementation.md §3.2 and Final_development.md §1).
+    Every method below is written against ib_async's documented API and this
+    adapter's own internal logic was exercised directly (contract/order
+    construction, connection lifecycle) with a stub in place of a real TWS
+    connection, but no live order has ever round-tripped a real account.
+    Treat this the same way this codebase already treats the MT5 EA bridge
+    before its first live fill: real code, unverified against the real thing.
+
+    Why TWS/IB Gateway rather than a raw FIX 4.2/4.4 drop: IBKR's FIX
+    interface (the guide's Chapter 5 description) is a separate institutional
+    arrangement requiring its own agreement, order-flow minimums, and a
+    dedicated network connection — not something obtainable in a dev
+    environment. The TWS API is IBKR's own documented retail/prosumer
+    integration path and is functionally equivalent for this app's purposes
+    (order submission, positions, fills) — the same category of pragmatic
+    substitute this codebase already uses elsewhere (e.g. the MT5 EA bridge
+    standing in for a native MT5 FIX/API connection).
+
+    Credentials (BrokerCredentials): host (default 127.0.0.1), port
+    (paper TWS 7497 / live TWS 7496 / paper Gateway 4002 / live Gateway 4001
+    — IBKR's own convention, not this app's choice), client_id (any int not
+    already in use on that TWS/Gateway instance). There is no username/
+    password at the API layer — TWS/Gateway itself is authenticated
+    separately (a person logs into the desktop app), and the API socket
+    trusts whatever's already logged in there.
+    """
+
+    _PAPER_PORT = 7497
+    _LIVE_PORT  = 7496
+
+    def _host(self) -> str:
+        return self.creds.get("host") or "127.0.0.1"
+
+    def _port(self) -> int:
+        port = self.creds.get("port")
+        if port:
+            return int(port)
+        return self._PAPER_PORT if self.broker.is_paper else self._LIVE_PORT
+
+    def _client_id(self) -> int:
+        # Random by default (not 0) so concurrent adapter calls from
+        # different requests don't collide on the same clientId — TWS/
+        # Gateway rejects a second simultaneous connection under one ID.
+        cid = self.creds.get("client_id")
+        if cid is not None:
+            return int(cid)
+        import random
+        return random.randint(1000, 999_999)
+
+    async def _connect(self):
+        from ib_async import IB
+        ib = IB()
+        await ib.connectAsync(self._host(), self._port(), clientId=self._client_id(), timeout=10)
+        return ib
+
+    @staticmethod
+    def _contract(symbol: str):
+        """
+        App symbol -> ib_async Contract. IBKR's practical retail/prosumer
+        surface (matching what this adapter targets) is equities and FX —
+        futures/options exist in the guide but need contract-month/strike
+        metadata this app's Symbol model doesn't carry, so they're not
+        attempted here. A slash-quoted pair where both sides look like
+        3-letter currency codes routes to Forex; anything else routes to
+        Stock (SMART routing, USD) — crypto has no real IBKR product for
+        the pairs this app trades, so it's rejected rather than guessed at.
+        """
+        from ib_async import Forex, Stock
+        s = symbol.strip().upper()
+        if "/" in s:
+            base, quote = s.split("/", 1)
+            if len(base) == 3 and len(quote) == 3 and base.isalpha() and quote.isalpha():
+                return Forex(f"{base}{quote}")
+            raise ConnectionError(
+                f"IBKR adapter has no product mapping for {symbol!r} — only "
+                f"equities and 3+3-letter FX pairs are supported."
+            )
+        return Stock(s, "SMART", "USD")
+
+    @staticmethod
+    def _ib_order(order: Order):
+        from ib_async import LimitOrder, MarketOrder, StopOrder
+        action = "BUY" if order.side == "BUY" else "SELL"
+        qty = float(order.qty)
+        if order.order_type == "MARKET":
+            return MarketOrder(action, qty)
+        if order.order_type == "LIMIT":
+            if not order.price:
+                raise ConnectionError("LIMIT order without a price")
+            return LimitOrder(action, qty, float(order.price))
+        if order.order_type == "STOP":
+            trigger = float(order.stop_price or order.price or 0)
+            if not trigger:
+                raise ConnectionError("STOP order without a trigger price")
+            return StopOrder(action, qty, trigger)
+        raise ConnectionError(f"Order type {order.order_type} not supported on IBKR")
+
+    async def test_connection(self) -> BrokerTestResult:
+        ib = None
+        try:
+            t0 = time.perf_counter()
+            ib = await self._connect()
+            summary = await ib.accountSummaryAsync()
+            latency = (time.perf_counter() - t0) * 1000
+            values = {row.tag: row.value for row in summary}
+            return BrokerTestResult(
+                success=True,
+                latency_ms=round(latency, 2),
+                message="Connected",
+                account_info={
+                    "net_liquidation": float(values.get("NetLiquidation") or 0),
+                    "buying_power": float(values.get("BuyingPower") or 0),
+                    "currency": values.get("Currency"),
+                },
+            )
+        except Exception as e:
+            return BrokerTestResult(success=False, latency_ms=None, message=str(e))
+        finally:
+            if ib is not None and ib.isConnected():
+                ib.disconnect()
+
+    async def get_account(self) -> dict:
+        ib = await self._connect()
+        try:
+            summary = await ib.accountSummaryAsync()
+            values = {row.tag: row.value for row in summary}
+            return {
+                "buying_power": float(values.get("BuyingPower") or 0),
+                "equity": float(values.get("NetLiquidation") or 0),
+                "currency": values.get("Currency"),
+            }
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    async def submit_order(self, order: Order) -> dict:
+        ib = await self._connect()
+        try:
+            contract = self._contract(order.symbol.symbol)
+            await ib.qualifyContractsAsync(contract)
+            ib_order = self._ib_order(order)
+            trade = ib.placeOrder(contract, ib_order)
+
+            # ib_async updates `trade` in place as TWS/Gateway sends events —
+            # poll briefly toward a terminal-or-acknowledged state rather
+            # than assuming an immediate fill (mirrors AlpacaAdapter's own
+            # short poll for the same reason: a MARKET order at a real
+            # exchange still takes a moment to print).
+            for _ in range(10):
+                status = trade.orderStatus.status
+                if status == "Filled":
+                    return {
+                        "broker_order_id": str(trade.order.orderId),
+                        "status": "FILLED",
+                        "avg_price": float(trade.orderStatus.avgFillPrice or 0),
+                        "filled_qty": float(trade.orderStatus.filled or order.qty),
+                    }
+                if status in ("Cancelled", "ApiCancelled", "Inactive"):
+                    raise ConnectionError(f"IBKR rejected/cancelled order: status={status}")
+                await asyncio.sleep(0.5)
+
+            return {
+                "broker_order_id": str(trade.order.orderId),
+                "status": "SUBMITTED",
+                "avg_price": None,
+            }
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    async def cancel_order(self, broker_order_id: str) -> dict:
+        ib = await self._connect()
+        try:
+            target_id = int(broker_order_id)
+            for trade in ib.openTrades():
+                if trade.order.orderId == target_id:
+                    ib.cancelOrder(trade.order)
+                    return {"status": "CANCELLED"}
+            return {"status": "CANCEL_FAILED"}
+        except Exception:
+            return {"status": "CANCEL_FAILED"}
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    async def get_positions(self) -> list[dict]:
+        ib = await self._connect()
+        try:
+            out = []
+            for p in ib.positions():
+                qty = float(p.position)
+                if qty == 0:
+                    continue
+                sym = p.contract.pair() if hasattr(p.contract, "pair") else p.contract.symbol
+                out.append({
+                    "symbol": sym,
+                    "qty": abs(qty),
+                    "side": "LONG" if qty > 0 else "SHORT",
+                    "avg_price": float(p.avgCost or 0),
+                })
+            return out
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+    async def get_fills(self, since: datetime | None = None) -> list[dict]:
+        ib = await self._connect()
+        try:
+            out = []
+            for f in ib.fills():
+                if since and f.time and f.time < since:
+                    continue
+                out.append({
+                    "broker_order_id": str(f.execution.orderId),
+                    "price": float(f.execution.price),
+                    "qty": float(f.execution.shares),
+                    "side": f.execution.side,
+                    "time": f.time.isoformat() if f.time else None,
+                })
+            return out
+        finally:
+            if ib.isConnected():
+                ib.disconnect()
+
+
+# ── Tradovate Adapter ─────────────────────────────────────────────────────────
+
+class TradovateAdapter(BrokerAdapter):
+    """
+    Tradovate futures execution over their REST API.
+
+    SCAFFOLDED, NOT LIVE-VERIFIED: no Tradovate account or API credentials
+    exist in this environment (access gap, not a code gap — same status as
+    IBKRAdapter above). Written directly against Tradovate's documented v1
+    REST API (api.tradovate.com / demo.tradovateapi.com), same raw-aiohttp
+    pattern as OandaAdapter, but the request/response shapes below have not
+    been exercised against a real Tradovate session.
+
+    Credential mapping (BrokerCredentials only has generic fields — Tradovate
+    needs five distinct values, so existing fields are repurposed rather than
+    growing the schema for one broker):
+      api_key    -> Tradovate username
+      api_secret -> Tradovate password
+      client_id  -> Tradovate's numeric API "cid" (issued per application)
+      passphrase -> Tradovate's API "sec" (client secret string)
+      account_id -> Tradovate trading account ID (numeric, required on every order)
+
+    Symbol handling: Tradovate trades futures contracts (e.g. "ESZ6"), which
+    carry contract-month/rollover metadata this app's Symbol model doesn't
+    have — order.symbol.symbol is forwarded to Tradovate as-is rather than
+    inventing a contract-month resolver. Whoever wires this up for real needs
+    Symbol rows that already carry a valid Tradovate contract code.
+    """
+
+    _DEMO_BASE = "https://demo.tradovateapi.com/v1"
+    _LIVE_BASE = "https://live.tradovateapi.com/v1"
+
+    def _base(self) -> str:
+        return self._DEMO_BASE if self.broker.is_paper else self._LIVE_BASE
+
+    def _account_id(self) -> str:
+        account_id = self.creds.get("account_id")
+        if not account_id:
+            raise ConnectionError(
+                "Tradovate credentials missing account_id (set it on the "
+                "broker in Connections)."
+            )
+        return str(account_id)
+
+    async def _authenticate(self) -> str:
+        """
+        Returns a fresh access token. No token caching across calls — this
+        adapter re-authenticates on every request, same simplicity trade-off
+        OandaAdapter makes with per-call sessions, appropriate for a
+        never-yet-exercised scaffold rather than a persistent-session design
+        that can't be verified against a real account anyway.
+        """
+        import aiohttp
+        body = {
+            "name": self.creds.get("api_key"),
+            "password": self.creds.get("api_secret"),
+            "appId": "PiOSQ",
+            "appVersion": "1.0",
+            "cid": self.creds.get("client_id"),
+            "sec": self.creds.get("passphrase"),
+            "deviceId": f"pios-{self.creds.get('client_id')}",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self._base()}/auth/accesstokenrequest", json=body, timeout=15
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status >= 400 or not data.get("accessToken"):
+                    raise ConnectionError(
+                        f"Tradovate auth rejected: {data.get('errorText') or data}"
+                    )
+                return data["accessToken"]
+
+    async def _request(self, method: str, path: str, body: dict | None = None) -> Any:
+        import aiohttp
+        token = await self._authenticate()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession() as session:
+            async with session.request(
+                method, f"{self._base()}{path}", headers=headers, json=body, timeout=15
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status >= 400:
+                    detail = (data or {}).get("errorText") or f"HTTP {response.status}"
+                    raise ConnectionError(f"Tradovate rejected: {detail}")
+                return data
+
+    async def test_connection(self) -> BrokerTestResult:
+        try:
+            t0 = time.perf_counter()
+            token = await self._authenticate()
+            latency = (time.perf_counter() - t0) * 1000
+            return BrokerTestResult(
+                success=bool(token),
+                latency_ms=round(latency, 2),
+                message="Connected",
+                account_info={"account_id": self.creds.get("account_id")},
+            )
+        except Exception as e:
+            return BrokerTestResult(success=False, latency_ms=None, message=str(e))
+
+    async def get_account(self) -> dict:
+        cash = await self._request("GET", f"/cashBalance/getcashbalancesnapshot?accountId={self._account_id()}")
+        return {
+            "buying_power": float((cash or {}).get("amount") or 0),
+            "equity": float((cash or {}).get("amount") or 0),
+            "currency": (cash or {}).get("currency"),
+        }
+
+    async def submit_order(self, order: Order) -> dict:
+        action = "Buy" if order.side == "BUY" else "Sell"
+        order_type_map = {"MARKET": "Market", "LIMIT": "Limit", "STOP": "Stop"}
+        tv_type = order_type_map.get(order.order_type)
+        if not tv_type:
+            raise ConnectionError(f"Order type {order.order_type} not supported on Tradovate")
+
+        body: dict[str, Any] = {
+            "accountId": int(self._account_id()),
+            "action": action,
+            "symbol": order.symbol.symbol,
+            "orderQty": float(order.qty),
+            "orderType": tv_type,
+            "isAutomated": True,
+        }
+        if order.order_type == "LIMIT":
+            if not order.price:
+                raise ConnectionError("LIMIT order without a price")
+            body["price"] = float(order.price)
+        elif order.order_type == "STOP":
+            trigger = float(order.stop_price or order.price or 0)
+            if not trigger:
+                raise ConnectionError("STOP order without a trigger price")
+            body["stopPrice"] = trigger
+
+        data = await self._request("POST", "/order/placeorder", body=body)
+        order_id = str((data or {}).get("orderId") or "")
+        failure_reason = (data or {}).get("failureReason")
+        if failure_reason:
+            raise ConnectionError(f"Tradovate rejected: {failure_reason}")
+        # Tradovate's placeorder response doesn't inline a fill — status is
+        # read back via order/list same as a resting order elsewhere in this
+        # app; no fill-sync loop exists for Tradovate yet (would mirror
+        # oanda_fill_sync.py's poll pattern once this adapter is live-tested).
+        return {"broker_order_id": order_id, "status": "SUBMITTED", "avg_price": None}
+
+    async def cancel_order(self, broker_order_id: str) -> dict:
+        try:
+            await self._request("POST", "/order/cancelorder", body={"orderId": int(broker_order_id)})
+            return {"status": "CANCELLED"}
+        except ConnectionError:
+            return {"status": "CANCEL_FAILED"}
+
+    async def get_positions(self) -> list[dict]:
+        data = await self._request("GET", "/position/list")
+        out = []
+        for p in data or []:
+            if str(p.get("accountId")) != self._account_id():
+                continue
+            qty = float(p.get("netPos") or 0)
+            if qty == 0:
+                continue
+            out.append({
+                "symbol": str(p.get("contractId")),
+                "qty": abs(qty),
+                "side": "LONG" if qty > 0 else "SHORT",
+                "avg_price": float(p.get("netPrice") or 0),
+            })
+        return out
+
+    async def get_fills(self, since: datetime | None = None) -> list[dict]:
+        data = await self._request("GET", "/fill/list")
+        out = []
+        for f in data or []:
+            if str(f.get("accountId")) != self._account_id():
+                continue
+            out.append({
+                "broker_order_id": str(f.get("orderId")),
+                "price": float(f.get("price") or 0),
+                "qty": float(f.get("qty") or 0),
+                "time": f.get("timestamp"),
+            })
+        return out
+
+
+# ── LMAX Adapter (FIX 4.4) ─────────────────────────────────────────────────────
+
+class LMAXAdapter(BrokerAdapter):
+    """
+    LMAX Exchange execution over a raw FIX 4.4 session.
+
+    SCAFFOLDED, NOT LIVE-VERIFIED, and the most speculative of the three
+    access-gated adapters (see final_implementation.md §3.2,
+    Final_development.md §1): LMAX only offers FIX access to institutional
+    clients with a signed agreement and a dedicated network endpoint — there
+    is no public sandbox to test message conventions against, unlike IBKR
+    (a free paper account) or Tradovate (a free demo account). Every message
+    below follows the generic FIX 4.4 session/order specification (message
+    types, tag numbers, checksum framing via `simplefix`) precisely, but
+    LMAX-specific conventions this adapter cannot verify without a real
+    account — exact required tags beyond the FIX 4.4 baseline, symbol
+    naming, session-reset behavior — may differ and would need adjusting
+    against LMAX's own FIX specification document once real access exists.
+
+    This implements a minimal FIX 4.4 session (TCP connect, Logon, sequence
+    numbering, heartbeat/TestRequest response, NewOrderSingle,
+    OrderCancelRequest, ExecutionReport parsing) rather than using a
+    QuickFIX-style engine — QuickFIX's Python bindings require compiling a
+    C++ extension, an unnecessary dependency for a session this simple and
+    this unverified.
+
+    Credential mapping (BrokerCredentials repurposed, same pattern as
+    TradovateAdapter — LMAX's FIX auth needs more distinct identifiers than
+    the schema's generic fields, so existing fields are reused rather than
+    growing the schema for one broker):
+      host, port -> FIX gateway address (LMAX-assigned, differs by
+                    environment/region)
+      api_key    -> SenderCompID (tag 49) — this app's identity to LMAX
+      passphrase -> TargetCompID (tag 56) — LMAX's own identity, assigned
+                    per client
+      account_id -> Account (tag 1) — the LMAX trading account number
+      api_secret -> Password (tag 554), sent in Logon only if provided —
+                    some FIX gateways rely on SenderCompID/TargetCompID +
+                    IP allowlisting instead and don't need it
+    """
+
+    _HEARTBEAT_INTERVAL = 30
+
+    def __init__(self, broker: Broker, credentials: dict):
+        super().__init__(broker, credentials)
+        self._seq_num = 1
+
+    def _next_seq(self) -> int:
+        n = self._seq_num
+        self._seq_num += 1
+        return n
+
+    def _header(self, msg, msg_type: str):
+        msg.append_pair(8, "FIX.4.4", header=True)
+        msg.append_pair(35, msg_type, header=True)
+        msg.append_pair(49, self.creds.get("api_key"), header=True)     # SenderCompID
+        msg.append_pair(56, self.creds.get("passphrase"), header=True)  # TargetCompID
+        msg.append_utc_timestamp(52, header=True)                       # SendingTime
+        msg.append_pair(34, self._next_seq(), header=True)              # MsgSeqNum
+
+    async def _connect_and_logon(self):
+        import simplefix
+        host = self.creds.get("host")
+        port = int(self.creds.get("port") or 0)
+        if not (host and port):
+            raise ConnectionError("LMAX credentials missing host/port for the FIX gateway.")
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=10
+        )
+
+        logon = simplefix.FixMessage()
+        self._header(logon, "A")
+        logon.append_pair(98, 0)                              # EncryptMethod: none
+        logon.append_pair(108, self._HEARTBEAT_INTERVAL)       # HeartBtInt
+        password = self.creds.get("api_secret")
+        if password:
+            logon.append_pair(554, password)                  # Password
+        writer.write(logon.encode())
+        await writer.drain()
+
+        parser = simplefix.FixParser()
+        raw = await asyncio.wait_for(reader.read(4096), timeout=10)
+        parser.append_buffer(raw)
+        response = parser.get_message()
+        if response is None or response.get(35) != b"A":
+            writer.close()
+            raise ConnectionError(
+                f"LMAX Logon rejected or no response "
+                f"(got MsgType={response.get(35) if response else None})"
+            )
+        return reader, writer, parser
+
+    @staticmethod
+    def _side_tag(order: Order) -> str:
+        return "1" if order.side == "BUY" else "2"  # FIX Side: 1=Buy, 2=Sell
+
+    def _new_order_single(self, order: Order):
+        import simplefix
+        msg = simplefix.FixMessage()
+        self._header(msg, "D")
+        msg.append_pair(11, str(order.client_order_id or order.id))  # ClOrdID
+        msg.append_pair(1, self.creds.get("account_id"))             # Account
+        msg.append_pair(55, order.symbol.symbol)                     # Symbol
+        msg.append_pair(54, self._side_tag(order))                   # Side
+        msg.append_utc_timestamp(60)                                  # TransactTime
+        msg.append_pair(38, float(order.qty))                         # OrderQty
+        if order.order_type == "MARKET":
+            msg.append_pair(40, "1")                                  # OrdType: Market
+        elif order.order_type == "LIMIT":
+            if not order.price:
+                raise ConnectionError("LIMIT order without a price")
+            msg.append_pair(40, "2")                                  # OrdType: Limit
+            msg.append_pair(44, float(order.price))                   # Price
+        elif order.order_type == "STOP":
+            trigger = float(order.stop_price or order.price or 0)
+            if not trigger:
+                raise ConnectionError("STOP order without a trigger price")
+            msg.append_pair(40, "3")                                  # OrdType: Stop
+            msg.append_pair(99, trigger)                              # StopPx
+        else:
+            raise ConnectionError(f"Order type {order.order_type} not supported on LMAX")
+        msg.append_pair(59, "0")                                      # TimeInForce: Day
+        return msg
+
+    @staticmethod
+    def _parse_execution_report(msg) -> dict:
+        """Maps FIX ExecutionReport (35=8) tags to this app's broker-result shape."""
+        ord_status = (msg.get(39) or b"").decode()
+        exec_type  = (msg.get(150) or b"").decode()
+        status_map = {"0": "SUBMITTED", "1": "PARTIAL", "2": "FILLED",
+                      "4": "CANCELLED", "8": "REJECTED"}
+        status = status_map.get(ord_status, "SUBMITTED")
+        return {
+            "broker_order_id": (msg.get(37) or b"").decode(),   # OrderID
+            "status": status,
+            "avg_price": float(msg.get(6) or 0),                 # AvgPx
+            "filled_qty": float(msg.get(14) or 0),               # CumQty
+            "exec_type": exec_type,
+            "reject_reason": (msg.get(58) or b"").decode() if status == "REJECTED" else None,
+        }
+
+    async def test_connection(self) -> BrokerTestResult:
+        writer = None
+        try:
+            t0 = time.perf_counter()
+            _, writer, _ = await self._connect_and_logon()
+            latency = (time.perf_counter() - t0) * 1000
+            return BrokerTestResult(
+                success=True, latency_ms=round(latency, 2), message="FIX Logon accepted",
+                account_info={"account": self.creds.get("account_id")},
+            )
+        except Exception as e:
+            return BrokerTestResult(success=False, latency_ms=None, message=str(e))
+        finally:
+            if writer is not None:
+                writer.close()
+
+    async def get_account(self) -> dict:
+        # LMAX's FIX drop is order/execution-only — account balance is a
+        # separate (non-FIX) reporting API this adapter doesn't implement;
+        # honestly report that rather than inventing a number.
+        raise ConnectionError(
+            "LMAX account balance is not available over FIX — LMAX exposes "
+            "balances via a separate reporting API not implemented here."
+        )
+
+    async def submit_order(self, order: Order) -> dict:
+        reader, writer, parser = await self._connect_and_logon()
+        try:
+            order_msg = self._new_order_single(order)
+            writer.write(order_msg.encode())
+            await writer.drain()
+
+            # Wait briefly for an ExecutionReport (35=8); a resting order may
+            # only send a NEW ack (39=0) rather than an immediate fill.
+            for _ in range(10):
+                raw = await asyncio.wait_for(reader.read(4096), timeout=2)
+                parser.append_buffer(raw)
+                msg = parser.get_message()
+                if msg is None:
+                    continue
+                if msg.get(35) == b"8":  # ExecutionReport
+                    return self._parse_execution_report(msg)
+                if msg.get(35) == b"1":  # TestRequest -> must Heartbeat back
+                    hb = __import__("simplefix").FixMessage()
+                    self._header(hb, "0")
+                    hb.append_pair(112, msg.get(112))
+                    writer.write(hb.encode())
+                    await writer.drain()
+            raise ConnectionError("LMAX: no ExecutionReport received within timeout")
+        finally:
+            writer.close()
+
+    async def cancel_order(self, broker_order_id: str) -> dict:
+        import simplefix
+        reader, writer, parser = await self._connect_and_logon()
+        try:
+            msg = simplefix.FixMessage()
+            self._header(msg, "F")  # OrderCancelRequest
+            msg.append_pair(41, broker_order_id)   # OrigClOrdID
+            msg.append_pair(11, f"cancel-{broker_order_id}")  # ClOrdID
+            msg.append_pair(1, self.creds.get("account_id"))
+            writer.write(msg.encode())
+            await writer.drain()
+            for _ in range(10):
+                raw = await asyncio.wait_for(reader.read(4096), timeout=2)
+                parser.append_buffer(raw)
+                resp = parser.get_message()
+                if resp is not None and resp.get(35) in (b"8", b"9"):
+                    return {"status": "CANCELLED" if resp.get(35) == b"8" else "CANCEL_FAILED"}
+            return {"status": "CANCEL_FAILED"}
+        except Exception:
+            return {"status": "CANCEL_FAILED"}
+        finally:
+            writer.close()
+
+    async def get_positions(self) -> list[dict]:
+        # Position reporting over FIX (RequestForPositions, 35=AN) needs a
+        # longer-lived session and multi-message reassembly this scaffold's
+        # per-call connect/disconnect model doesn't support yet — honestly
+        # unimplemented rather than approximated.
+        raise ConnectionError(
+            "LMAX position reporting over FIX is not implemented in this "
+            "scaffold — needs RequestForPositions (35=AN) session support."
+        )
+
+    async def get_fills(self, since: datetime | None = None) -> list[dict]:
+        return []
+
+
 # ── Paper / Simulation Adapter ────────────────────────────────────────────────
 
 class PaperAdapter(BrokerAdapter):
@@ -641,9 +1289,12 @@ ADAPTER_MAP = {
     "ALPACA": AlpacaAdapter,
     "BINANCE": CCXTAdapter,
     "CCXT": CCXTAdapter,
+    "IBKR": IBKRAdapter,
+    "LMAX": LMAXAdapter,
     "MT5": MT5Adapter,
     "OANDA": OandaAdapter,
     "PAPER": PaperAdapter,
+    "TRADOVATE": TradovateAdapter,
 }
 
 

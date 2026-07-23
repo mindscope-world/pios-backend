@@ -5,7 +5,7 @@ from fastapi import HTTPException
 import numpy as np
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.helpers.helpers import latest_regime, open_positions, primary_symbol, recent_ticks, get_primary_with_ticks, get_symbol_with_ticks, safe_float, now_iso,safe_ms
+from app.helpers.helpers import latest_regime, open_positions, primary_symbol, recent_ticks, get_primary_with_ticks, get_symbol_with_ticks, safe_float, now_iso, safe_ms, is_feed_stale
 from app.core.deps import get_current_user
 from app.db.session import get_db
 from app.models.all_models import PnLSnapshot, Strategy
@@ -137,6 +137,7 @@ async def compute_command_center_current(current_user, db, symbol: str | None = 
             sides,
             regime_override=regime.regime_label if regime else None,
             positions_exposure=exposure_pct,
+            feed_stale=is_feed_stale(ticks),
         )
  
         # Signal conflicts

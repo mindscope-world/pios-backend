@@ -1314,24 +1314,36 @@ def build_quant_core_gates(
     sides: list[str],
     regime_override: str | None = None,
     positions_exposure: float = 0.0,
+    feed_stale: bool = False,
 ) -> tuple[str, float, list[dict], dict]:
     """
     Run the full 8-gate Quant Core pipeline.
     Returns: (decision, confidence, gates_list, size_info)
+
+    feed_stale: set by the caller from the Continuity Monitor's staleness
+    condition (see continuity_monitor.py / command_center_service.py) — a
+    symbol whose own tick feed has gone quiet for longer than
+    CONTINUITY_GAP_THRESHOLD_SECS is blocked here regardless of every other
+    gate, matching the guide's Chapter 7: "dependent strategies are
+    automatically paused... until the feed is confirmed healthy again."
     """
     now = datetime.now(timezone.utc).isoformat()
 
     # Gate D3.1 — Data Quality
     dq = detect_outlier_ticks(prices, volumes)
     dq_score = dq["dq_score"]
+    dq_ok = dq_score >= 80 and not feed_stale
     g_dq = {
         "id": "D3.1", "name": "Data Quality Gate",
-        "status": "PASS" if dq_score >= 80 else "WARN",
-        "latency_ms": 0.4, "passed": dq_score >= 80,
+        "status": "FEED STALE" if feed_stale else ("PASS" if dq_score >= 80 else "WARN"),
+        "latency_ms": 0.4, "passed": dq_ok,
         "confidence": round(dq_score / 100, 4),
         "confidence_low": round(max(0, dq_score - 5) / 100, 4),
         "confidence_high": round(min(100, dq_score + 5) / 100, 4),
-        "detail": f"LOF DQ score {dq_score}% ({len(dq['outlier_indices'])} outliers)",
+        "detail": (
+            f"LOF DQ score {dq_score}% ({len(dq['outlier_indices'])} outliers)"
+            + (" — feed stale, Continuity Monitor blocking new decisions" if feed_stale else "")
+        ),
     }
 
     # Gate D3.2 — Volatility (GARCH)
@@ -1412,7 +1424,11 @@ def build_quant_core_gates(
 
     # Gate D3.8 — Final Decision
     all_ok = all([regime_ok, ofi_ok, conflict_ok, risk_ok, g_dq["passed"]])
-    if not regime_ok:       decision = "BLOCK"
+    # feed_stale checked first and unconditionally — a symbol with no
+    # trustworthy current data shouldn't be evaluated against regime/OFI/
+    # conflict/risk at all, let alone allowed to override them.
+    if feed_stale:          decision = "BLOCK"
+    elif not regime_ok:     decision = "BLOCK"
     elif not ofi_ok:        decision = "WAIT"
     elif conflict["level"] == "HIGH": decision = "REDUCE"
     elif not risk_ok:       decision = "REDUCE"

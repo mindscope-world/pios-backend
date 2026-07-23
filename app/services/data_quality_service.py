@@ -21,10 +21,27 @@ async def compute_data_quality_summary(
     hours = max(1, min(168, hours))
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    total_result = await db.execute(
-        select(func.count(DQEvent.id)).where(DQEvent.created_at >= since)
-    )
-    total = total_result.scalar_one() or 1
+    # Real pass/flag/reject counts, not hardcoded constants. MarketTick only
+    # ever holds PASS + FLAG ticks (REJECTed ticks never reach the table —
+    # see db_writer.py's flush_ticks docstring), while DQEvent holds every
+    # FLAG *and* REJECT (never PASS) — so flag_count double-counts across
+    # both tables and must be read from DQEvent, with pass_count backed out
+    # of MarketTick's total minus that same flag_count.
+    total_reject_count = (await db.execute(
+        select(func.count(DQEvent.id)).where(
+            DQEvent.event_type == "REJECT", DQEvent.created_at >= since,
+        )
+    )).scalar_one()
+    total_flag_count = (await db.execute(
+        select(func.count(DQEvent.id)).where(
+            DQEvent.event_type == "FLAG", DQEvent.created_at >= since,
+        )
+    )).scalar_one()
+    tick_rows = (await db.execute(
+        select(func.count(MarketTick.id)).where(MarketTick.time >= since)
+    )).scalar_one()
+    total_pass_count = max(0, tick_rows - total_flag_count)
+    total_ticks = total_pass_count + total_flag_count + total_reject_count
 
     module_names = [
         "TICK_VALIDATOR",
@@ -78,10 +95,10 @@ async def compute_data_quality_summary(
     gaps = gap_result.scalar_one()
 
     return DQStatsOut(
-        total_ticks=total * 1000,
-        pass_rate=96.8,
-        flag_rate=2.4,
-        reject_rate=0.8,
+        total_ticks=total_ticks,
+        pass_rate=round(total_pass_count / total_ticks * 100, 1) if total_ticks else 0.0,
+        flag_rate=round(total_flag_count / total_ticks * 100, 1) if total_ticks else 0.0,
+        reject_rate=round(total_reject_count / total_ticks * 100, 1) if total_ticks else 0.0,
         gaps=gaps,
         modules=modules,
     )
