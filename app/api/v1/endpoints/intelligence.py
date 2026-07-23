@@ -184,7 +184,7 @@ async def gmig_radar(
 @router.get("/montecarlo")
 async def monte_carlo(
     symbol: str | None = Query(None),
-    simulations: int = Query(2000, ge=100, le=5000),
+    simulations: int = Query(10_000, ge=100, le=20_000),
     horizon_days: int = Query(30, ge=5, le=90),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -456,7 +456,7 @@ async def ofi_auto_signal(
 
 @router.get("/montecarlo/auto")
 async def monte_carlo_auto(
-    simulations: int = Query(2000, ge=100, le=5000),
+    simulations: int = Query(10_000, ge=100, le=20_000),
     horizon_days: int = Query(30, ge=5, le=90),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),

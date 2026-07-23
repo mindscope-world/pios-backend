@@ -4,7 +4,8 @@ from sqlalchemy import select, desc, func
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql import over
 from app.core import deps
-from app.models.all_models import MarketTick, Symbol
+from app.core.deps import require_quant
+from app.models.all_models import MarketTick, Symbol, User
 
 router = APIRouter(prefix="/market", tags=["market-data"])
 
@@ -128,3 +129,30 @@ async def get_latest_tickers(
         })
 
     return output
+
+
+@router.post("/backfill")
+async def trigger_historical_backfill(
+    symbol: str = Query(...),
+    days: int = Query(30, ge=1, le=180),
+    timeframe: str = Query("5m"),
+    exchange_id: str | None = Query(None),
+    _: User = Depends(require_quant),
+):
+    """
+    Queue a historical backfill (Guide Ch.12 — "historical data depth for
+    research"): candle-derived synthetic ticks, written with candle_ref set
+    so they're distinguishable from real streamed ticks. See
+    historical_backfill_service.py for exactly what this does and does not
+    reconstruct. Admin/quant-gated — a bulk import against a live vendor
+    API is an operator action, not something any authenticated user should
+    be able to fire at will.
+    """
+    from app.workers.backtest_worker import historical_backfill_task
+    try:
+        task = historical_backfill_task.delay(symbol, days=days, timeframe=timeframe, exchange_id=exchange_id)
+        return {"queued": True, "symbol": symbol, "days": days, "timeframe": timeframe, "celery_task_id": task.id}
+    except Exception:
+        from app.services.historical_backfill_service import backfill_symbol
+        result = backfill_symbol(symbol, days=days, timeframe=timeframe, exchange_id=exchange_id)
+        return {"queued": False, "ran_inline": True, **result}

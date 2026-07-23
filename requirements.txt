@@ -63,6 +63,14 @@ Faker==40.15.0
 fastapi==0.111.1
 fastapi-cli==0.0.24
 filelock==3.29.0
+# FinRL is listed but not imported: its package __init__.py eagerly pulls in
+# an unrelated paper-trading module (finrl.trade) requiring the legacy
+# alpaca_trade_api SDK, which conflicts with yfinance's websockets>=13.0
+# requirement (installing it downgrades websockets to 10.4 -- verified live,
+# 2026-07-23). Alpha Factory's RL idea generation is instead built directly
+# on stable-baselines3 (the RL library FinRL itself wraps around) against a
+# custom minimal single-asset Gym environment -- same real PPO training,
+# without the conflicting dependency.
 FinRL==0.3.7
 Flask==3.1.3
 flask-cors==6.0.2
@@ -72,6 +80,7 @@ frozenlist==1.8.0
 fsspec==2026.3.0
 gitdb==4.0.12
 GitPython==3.1.46
+gymnasium==1.3.0
 google-api-core==2.30.3
 google-auth==2.49.2
 googleapis-common-protos==1.74.0
@@ -171,6 +180,7 @@ opentelemetry-proto==1.41.0
 opentelemetry-sdk==1.41.0
 opentelemetry-semantic-conventions==0.62b0
 opt_einsum==3.4.0
+optuna==4.9.0
 orjson==3.11.8
 osqp==1.1.1
 packaging==26.1
@@ -251,6 +261,7 @@ soupsieve==2.8.3
 SQLAlchemy==2.0.31
 sqlparse==0.5.5
 sseclient-py==1.9.0
+stable-baselines3==2.9.0
 stack-data==0.6.3
 starlette==0.37.2
 statsmodels==0.14.6

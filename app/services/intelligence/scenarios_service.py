@@ -41,7 +41,7 @@ async def compute_scenarios(current_user: User, db: AsyncSession, symbol: str | 
  
         mc = run_monte_carlo(
             prices,
-            n_sims=2000,
+            n_sims=10_000,
             horizon_days=30,
             vol_override=daily_vol / 100,
         )

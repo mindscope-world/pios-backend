@@ -537,6 +537,12 @@ def _composite_signal(
 REGIME_LABELS = {0: "BULL", 1: "BEAR", 2: "RANGE", 3: "CRISIS"}
 REGIME_SIZE_MULT = {"BULL": 1.0, "BEAR": 0.6, "RANGE": 0.8, "CRISIS": 0.3, "RECOVERY": 0.7}
 
+# Shared flat-fee proxy for the backtest cost model (D2.2 Component 6 is the
+# full SWAP_TABLE/PIP_CFG transaction-cost model; not yet built -- this bps
+# table is the interim approximation used by both the legacy placeholder
+# simulator and the five real strategy simulators).
+COST_MODEL_FEE_BPS = {"FULL": 8, "FEES_ONLY": 4, "SLIPPAGE_ONLY": 4, "ZERO_COST": 0}
+
 
 def detect_regime_hmm(prices: list[float], n_states: int = 4) -> dict:
     """
@@ -761,16 +767,39 @@ def _ofi_fallback():
 # § 4  MONTE CARLO — Numpyro-style vectorised paths (D2.3)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _stress_final_returns(
+    mu: float, sigma: float, horizon_days: int, n_sims: int, rng: np.random.Generator,
+    drift_shift: float = 0.0, vol_mult: float = 1.0, jump_prob: float = 0.0, jump_size: float = 0.0,
+) -> np.ndarray:
+    """One independently-shocked simulation for a single stress scenario --
+    not a relabeling of the base run's percentiles. drift_shift/vol_mult
+    perturb the daily log-return process itself; jump_prob/jump_size inject
+    a discrete Merton-style jump (expected ~1 jump per path when
+    jump_prob = 1/horizon_days)."""
+    sigma_eff = max(sigma * vol_mult, 1e-8)
+    shocks = rng.normal(mu + drift_shift - 0.5 * sigma_eff**2, sigma_eff, (n_sims, horizon_days))
+    if jump_prob > 0:
+        jump_mask = rng.random((n_sims, horizon_days)) < jump_prob
+        shocks = shocks + jump_mask * jump_size
+    paths = np.exp(np.cumsum(shocks, axis=1))
+    return (paths[:, -1] - 1.0) * 100
+
+
 def run_monte_carlo(
     prices: list[float],
-    n_sims: int = 2000,
+    n_sims: int = 10_000,
     horizon_days: int = 30,
     vol_override: float | None = None,
 ) -> dict:
     """
     Run log-normal Monte Carlo simulation using GARCH-estimated volatility.
     Uses numpy for speed (numpyro/GPU optional). Returns P5/P50/P95,
-    histogram, scenario cases, and stress tests.
+    histogram, scenario cases, and stress tests. Default n_sims=10,000
+    matches the guide's Ch.11 spec for the on-demand /montecarlo and
+    /scenarios report paths; per-fold walk-forward calls (backtest_worker.py)
+    deliberately pass a smaller n_sims -- running 10k sims inside every one
+    of 12 folds x 5 strategies would be a real perf regression for a number
+    that isn't the headline-reported one anyway.
     """
     if len(prices) < 20:
         return {"error": "insufficient_data"}
@@ -813,21 +842,43 @@ def run_monte_carlo(
          "description": "Risk-off, tail stress scenario"},
     ]
 
-    # Stress tests using historical worst-case paths
-    worst_1pct = float(np.percentile(final, 1))
+    # Stress tests: each is its own independently-shocked simulation, not a
+    # relabeling of the base distribution's percentiles (worst_1pct/p5) --
+    # a discrete jump for Flash Crash, a sustained negative-drift regime for
+    # Macro Shock, an amplified shared-shock-variance proxy for Correlation
+    # Breakdown (this function only ever sees one asset's price series --
+    # true cross-asset correlation breakdown needs a portfolio covariance
+    # model no caller here has; amplified variance is the honest
+    # single-asset stand-in), and a pure volatility-regime blowup for the
+    # 4-sigma vol spike.
+    flash_final = _stress_final_returns(
+        mu, sigma, horizon_days, n_sims, rng,
+        vol_mult=1.5, jump_prob=1.0 / horizon_days, jump_size=math.log(0.80),
+    )
+    macro_final = _stress_final_returns(
+        mu, sigma, horizon_days, n_sims, rng, drift_shift=-3.0 * sigma, vol_mult=1.3,
+    )
+    corr_final = _stress_final_returns(
+        mu, sigma, horizon_days, n_sims, rng, drift_shift=-1.0 * sigma, vol_mult=2.0,
+    )
+    vol_final = _stress_final_returns(
+        mu, sigma, horizon_days, n_sims, rng, vol_mult=4.0,
+    )
+
+    def _stress_row(name: str, trigger: str, final_arr: np.ndarray, kill_threshold: float) -> dict:
+        worst = float(np.percentile(final_arr, 1))
+        return {
+            "name": name, "trigger": trigger,
+            "expected_pnl": round(float(np.percentile(final_arr, 5)), 2),
+            "max_dd_pct": round(worst, 2),
+            "kill_switch_fires": worst < kill_threshold,
+        }
+
     stress_tests = [
-        {"name": "Flash Crash −20%", "trigger": "Liquidity withdrawal / exchange halt",
-         "expected_pnl": round(worst_1pct * 1.5, 2), "max_dd_pct": round(worst_1pct * 2, 2),
-         "kill_switch_fires": worst_1pct < -12},
-        {"name": "Macro Shock −10%", "trigger": "Fed rate surprise / CPI print",
-         "expected_pnl": round(worst_1pct * 0.8, 2), "max_dd_pct": round(worst_1pct, 2),
-         "kill_switch_fires": worst_1pct < -20},
-        {"name": "Correlation Breakdown", "trigger": "All assets correlated ρ→1",
-         "expected_pnl": round(p5 * 0.6, 2), "max_dd_pct": round(abs(p5) * 0.5, 2),
-         "kill_switch_fires": False},
-        {"name": "Vol Spike 4σ", "trigger": "VIX-equivalent spikes above 40",
-         "expected_pnl": round(worst_1pct * 1.2, 2), "max_dd_pct": round(abs(worst_1pct) * 1.5, 2),
-         "kill_switch_fires": worst_1pct < -15},
+        _stress_row("Flash Crash −20%", "Liquidity withdrawal / exchange halt (discrete jump injected)", flash_final, -12),
+        _stress_row("Macro Shock −10%", "Fed rate surprise / CPI print (sustained negative-drift regime)", macro_final, -20),
+        _stress_row("Correlation Breakdown", "All assets correlated ρ→1 (amplified shared-shock variance proxy)", corr_final, -18),
+        _stress_row("Vol Spike 4σ", "VIX-equivalent spikes above 40 (4x volatility regime)", vol_final, -15),
     ]
 
     return {
@@ -1604,5 +1655,207 @@ def compute_technical_indicators(
     except Exception:
         out["composite_signal"] = None
         out["composite_bias"]   = None
- 
+
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 11  PROPRIETARY STRATEGY PRIMITIVES — v10 D2.2 "The Five Strategies"
+# ═══════════════════════════════════════════════════════════════════════════════
+# Math sourced verbatim from PiOSQ_Complete_v10_Specification D2.2. Where a
+# window/lookback isn't given a specific number in the spec text (only the
+# formula shape is), a labeled default is used and exposed as a tunable
+# strategy config param -- never invented math, only invented constants.
+
+def estimate_ou_process(prices: list[float], dt: float = 1.0) -> dict:
+    """
+    Ornstein-Uhlenbeck calibration via linear regression on differences
+    (v10 D2.2 Strategy 2):
+        ΔX_t = a + b·X_t + ε_t              (OLS)
+        κ = -log(1+b)/Δt   μ = -a/b   half_life = log(2)/κ
+    `half_life` is in bars (Δt=1 bar); caller converts to wall-clock hours
+    using the series' own average bar interval, since the spec's "2h <
+    half_life < 120h" filter is expressed in time, not bar count.
+    """
+    x = np.asarray(prices, dtype=float)
+    if len(x) < 20:
+        return {"kappa": None, "mu": None, "half_life": None, "sigma": None, "b": None}
+
+    x_t   = x[:-1]
+    dx    = np.diff(x)
+    A     = np.vstack([np.ones_like(x_t), x_t]).T
+    try:
+        coeffs, *_ = np.linalg.lstsq(A, dx, rcond=None)
+        a, b = float(coeffs[0]), float(coeffs[1])
+    except Exception:
+        return {"kappa": None, "mu": None, "half_life": None, "sigma": None, "b": None}
+
+    if b >= 0 or (1 + b) <= 0:
+        # Non mean-reverting (b >= 0 implies a trending/unit-root series, not OU)
+        return {"kappa": None, "mu": None, "half_life": None, "sigma": None, "b": round(b, 8)}
+
+    kappa = -math.log(1 + b) / dt
+    mu    = -a / b
+    half_life = math.log(2) / kappa if kappa > 0 else None
+
+    resid = dx - (a + b * x_t)
+    sigma = float(np.std(resid)) / math.sqrt(dt) if len(resid) else None
+
+    return {
+        "kappa": round(kappa, 8) if kappa else None,
+        "mu": round(mu, 8),
+        "half_life": round(half_life, 4) if half_life else None,
+        "sigma": round(sigma, 8) if sigma is not None else None,
+        "b": round(b, 8),
+    }
+
+
+def compute_hurst_exponent(returns: list[float], n_chunks: int = 4) -> dict:
+    """
+    Hurst exponent via classical rescaled-range (R/S) analysis (v10 D2.2
+    Strategy 5): H = log(E[R/S]) / log(n). E[R/S] is estimated by splitting
+    the input into `n_chunks` non-overlapping sub-samples of length n,
+    computing R/S in each, and averaging -- the literal "expectation" the
+    spec formula calls for.
+    """
+    r = np.asarray(returns, dtype=float)
+    n = len(r) // n_chunks
+    if n < 8 or len(r) < 16:
+        return {"H": 0.5, "n": n, "engine": "INSUFFICIENT_DATA"}
+
+    rs_values = []
+    for c in range(n_chunks):
+        chunk = r[c * n:(c + 1) * n]
+        mean_adj = chunk - chunk.mean()
+        cum_dev  = np.cumsum(mean_adj)
+        R = float(cum_dev.max() - cum_dev.min())
+        S = float(chunk.std())
+        if S > 1e-12:
+            rs_values.append(R / S)
+
+    if not rs_values:
+        return {"H": 0.5, "n": n, "engine": "DEGENERATE"}
+
+    e_rs = float(np.mean(rs_values))
+    if e_rs <= 0 or n <= 1:
+        return {"H": 0.5, "n": n, "engine": "DEGENERATE"}
+
+    h = math.log(e_rs) / math.log(n)
+    h = min(1.0, max(0.0, h))
+    return {"H": round(h, 4), "n": n, "engine": "RS_ANALYSIS"}
+
+
+def estimate_gjr_garch_path(prices: list[float]) -> dict:
+    """
+    GJR-GARCH(1,1) conditional volatility path (v10 D2.2 Strategy 3):
+        σ²(t+1) = ω + α·ε²(t) + γ·I⁻(t)·ε²(t) + β·σ²(t)
+    Returns the *full* in-sample conditional-volatility series (not just the
+    last point, unlike `estimate_volatility_garch`) so a per-bar
+    vol_ratio = σ_t / rolling_mean(σ,20) can be computed across a backtest
+    fold. `o=1` is what makes this GJR (asymmetric leverage term) rather
+    than plain GARCH(1,1).
+    """
+    p = np.asarray(prices, dtype=float)
+    if len(p) < 40:
+        rets = np.diff(np.log(p + 1e-10))
+        roll = _rolling_std(rets, min(10, max(2, len(rets))))
+        return {"vol_path": roll.tolist(), "engine": "ROLLING_STD"}
+
+    log_rets = np.diff(np.log(p + 1e-10)) * 100
+
+    if ARCH_AVAILABLE:
+        try:
+            am  = arch_model(log_rets, vol="GARCH", p=1, o=1, q=1, dist="skewt", rescale=True)
+            res = am.fit(disp="off", options={"maxiter": 200})
+            return {
+                "vol_path": (res.conditional_volatility / 100).tolist(),
+                "engine": "GJR-GARCH(1,1)-skewt",
+            }
+        except Exception as e:
+            log.warning(f"GJR-GARCH failed: {e}")
+
+    roll = _rolling_std(log_rets / 100, 20)
+    return {"vol_path": roll.tolist(), "engine": "ROLLING_STD_20"}
+
+
+def _rolling_std(arr: np.ndarray, window: int) -> np.ndarray:
+    window = max(2, window)
+    out = np.full(len(arr), np.nan)
+    for i in range(window, len(arr) + 1):
+        out[i - 1] = arr[i - window:i].std()
+    if len(arr):
+        first_valid = next((v for v in out if not np.isnan(v)), float(np.std(arr)) if len(arr) else 0.0)
+        out = np.where(np.isnan(out), first_valid, out)
+    return out
+
+
+def compute_rolling_ols_residual(
+    y_prices: list[float],
+    x_prices: list[float],
+    window: int = 60,
+) -> dict:
+    """
+    Rolling-OLS residual + Engle-Granger cointegration pre-filter (v10 D2.2
+    Strategy 4, BTC-Neutral):
+        R_y = α + β_t·R_x + ε_t     (rolling OLS on returns, window=60)
+        z = (ε_t - mean(ε,60)) / std(ε,60)
+        Pre-filter: coint(y,x) p-value < 0.05
+    `y_prices`/`x_prices` must be the same length and index-aligned (same
+    timestamps) -- caller is responsible for alignment across two symbols.
+    """
+    y = np.asarray(y_prices, dtype=float)
+    x = np.asarray(x_prices, dtype=float)
+    n = min(len(y), len(x))
+    y, x = y[:n], x[:n]
+
+    if n < window + 10:
+        return {"beta": [], "residual": [], "z": [], "coint_pvalue": None, "engine": "INSUFFICIENT_DATA"}
+
+    r_y = np.diff(np.log(y + 1e-10))
+    r_x = np.diff(np.log(x + 1e-10))
+
+    beta = np.full(len(r_y), np.nan)
+    alpha = np.full(len(r_y), np.nan)
+    for i in range(window, len(r_y) + 1):
+        wy = r_y[i - window:i]
+        wx = r_x[i - window:i]
+        A = np.vstack([np.ones_like(wx), wx]).T
+        try:
+            coeffs, *_ = np.linalg.lstsq(A, wy, rcond=None)
+            alpha[i - 1], beta[i - 1] = float(coeffs[0]), float(coeffs[1])
+        except Exception:
+            pass
+
+    valid = ~np.isnan(beta)
+    if valid.any():
+        first_a, first_b = alpha[valid][0], beta[valid][0]
+        alpha = np.where(np.isnan(alpha), first_a, alpha)
+        beta  = np.where(np.isnan(beta), first_b, beta)
+    else:
+        alpha = np.zeros_like(alpha)
+        beta  = np.zeros_like(beta)
+
+    residual = r_y - (alpha + beta * r_x)
+
+    z = np.zeros_like(residual)
+    for i in range(window, len(residual) + 1):
+        w = residual[i - window:i]
+        sd = w.std()
+        z[i - 1] = (residual[i - 1] - w.mean()) / sd if sd > 1e-12 else 0.0
+
+    coint_p = None
+    if STATSMODELS_AVAILABLE:
+        try:
+            from statsmodels.tsa.stattools import coint as _coint
+            _, pvalue, _ = _coint(y, x)
+            coint_p = float(pvalue)
+        except Exception as e:
+            log.warning(f"cointegration test failed: {e}")
+
+    return {
+        "beta": beta.tolist(),
+        "residual": residual.tolist(),
+        "z": z.tolist(),
+        "coint_pvalue": round(coint_p, 6) if coint_p is not None else None,
+        "engine": "ROLLING_OLS_60" if STATSMODELS_AVAILABLE else "ROLLING_OLS_60_NO_COINT",
+    }
